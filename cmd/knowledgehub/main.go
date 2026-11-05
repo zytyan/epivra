@@ -23,7 +23,7 @@ import (
 	"epivra/internal/httpapi"
 	"epivra/internal/hub"
 	"epivra/internal/mcpserver"
-	"epivra/migrations"
+	"epivra/schema"
 	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
@@ -92,13 +92,13 @@ func run() error {
 	if len(os.Args) > 1 {
 		command = os.Args[1]
 	}
-	if command == "migrate" {
-		return migrations.Apply(ctx, db)
+	if command == "init-db" {
+		return schema.Initialize(ctx, db)
 	}
 	if command != "serve" {
 		return admin(ctx, db, command, os.Args[2:])
 	}
-	if err = migrations.Apply(ctx, db); err != nil {
+	if err = schema.Initialize(ctx, db); err != nil {
 		return err
 	}
 	upload, err := number("MAX_UPLOAD_BYTES", 20<<20)
@@ -214,6 +214,6 @@ func admin(ctx context.Context, db *sql.DB, command string, args []string) error
 		n, _ := res.RowsAffected()
 		return json.NewEncoder(os.Stdout).Encode(map[string]int64{"revoked": n})
 	default:
-		return fmt.Errorf("commands: serve, migrate, workspace-create, key-issue, key-revoke, healthcheck")
+		return fmt.Errorf("commands: serve, init-db, workspace-create, key-issue, key-revoke, healthcheck")
 	}
 }

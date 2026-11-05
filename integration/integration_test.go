@@ -18,7 +18,7 @@ import (
 	"time"
 
 	"epivra/internal/hub"
-	"epivra/migrations"
+	"epivra/schema"
 	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
@@ -39,8 +39,8 @@ func setup(t *testing.T) *fixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	schema := "test_" + strings.ReplaceAll(hub.NewID(), "-", "")
-	if _, err = admin.Exec(`CREATE SCHEMA ` + schema); err != nil {
+	schemaName := "test_" + strings.ReplaceAll(hub.NewID(), "-", "")
+	if _, err = admin.Exec(`CREATE SCHEMA ` + schemaName); err != nil {
 		t.Fatal(err)
 	}
 	u, err := url.Parse(dsn)
@@ -48,20 +48,20 @@ func setup(t *testing.T) *fixture {
 		t.Fatal(err)
 	}
 	q := u.Query()
-	q.Set("search_path", schema+",public")
+	q.Set("search_path", schemaName+",public")
 	u.RawQuery = q.Encode()
 	db, err := sql.Open("pgx", u.String())
 	if err != nil {
 		t.Fatal(err)
 	}
 	db.SetMaxOpenConns(20)
-	t.Cleanup(func() { db.Close(); admin.Exec(`DROP SCHEMA ` + schema + ` CASCADE`); admin.Close() })
+	t.Cleanup(func() { db.Close(); admin.Exec(`DROP SCHEMA ` + schemaName + ` CASCADE`); admin.Close() })
 	ctx := context.Background()
-	if err = migrations.Apply(ctx, db); err != nil {
+	if err = schema.Initialize(ctx, db); err != nil {
 		t.Fatal(err)
 	}
-	if err = migrations.Apply(ctx, db); err != nil {
-		t.Fatal("migration not idempotent", err)
+	if err = schema.Initialize(ctx, db); err != nil {
+		t.Fatal("initialization not idempotent", err)
 	}
 	f := &fixture{t: t, s: &hub.Service{DB: db}, actor: hub.NewID(), ws: hub.NewID(), key: "test_" + hub.NewID(), ctx: ctx}
 	hash := sha256.Sum256([]byte(f.key))
@@ -278,6 +278,7 @@ func TestReviewAcknowledgesOnlyExplicitEvents(t *testing.T) {
 func mustJSON(v any) string { b, _ := json.Marshal(v); return string(b) }
 func TestSearchIndexAndLeaseRecovery(t *testing.T) {
 	f := setup(t)
+	requireVector(t, f)
 	src, _, _, k := f.loop()
 	hits := f.call("knowledge_search", hub.Params{Mode: "keyword", Query: "文知", Tags: []string{"中文"}}).Data.([]hub.Hit)
 	if len(hits) != 1 || hits[0].Ref != k {
@@ -452,6 +453,7 @@ func TestOutstandingEventsBeforePublicationAndRemovedClaims(t *testing.T) {
 
 func TestInlineEvidenceAndRetryExhaustion(t *testing.T) {
 	f := setup(t)
+	requireVector(t, f)
 	source := f.source("seed")
 	claim := ref(f.call("claim_create", hub.Params{Body: "test claim", Sources: []hub.Ref{source}}))
 	now := time.Now().UTC()
@@ -499,4 +501,92 @@ func TestInlineEvidenceAndRetryExhaustion(t *testing.T) {
 	if state != "failed" || attempts != 5 {
 		t.Fatal("unbounded retry", state, attempts)
 	}
+}
+
+func requireVector(t *testing.T, f *fixture) {
+	t.Helper()
+	var enabled bool
+	if err := f.s.DB.QueryRow(`SELECT EXISTS(SELECT 1 FROM pg_extension WHERE extname='vector')`).Scan(&enabled); err != nil {
+		t.Fatal(err)
+	}
+	if !enabled {
+		t.Skip("semantic indexing test requires pgvector enabled in TEST_DATABASE_URL")
+	}
+}
+
+func TestWithoutVector(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL required")
+	}
+	admin, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { admin.Close() })
+	// A separate database guarantees the extension is absent without dropping it
+	// from the caller's database or from another concurrently running test.
+	name := "optional_" + strings.ReplaceAll(hub.NewID(), "-", "")
+	if _, err = admin.Exec(`CREATE DATABASE ` + name + ` TEMPLATE template0 ENCODING 'UTF8'`); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if _, err := admin.Exec(`DROP DATABASE ` + name); err != nil {
+			t.Error(err)
+		}
+	})
+	u, err := url.Parse(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	u.Path = "/" + name
+	t.Setenv("TEST_DATABASE_URL", u.String())
+	f := setup(t)
+	_, _, _, k := f.loop()
+	var chunks sql.NullString
+	if err = f.s.DB.QueryRow(`SELECT to_regclass('chunks')::text`).Scan(&chunks); err != nil {
+		t.Fatal(err)
+	}
+	if chunks.Valid {
+		t.Fatal("vector table created without extension")
+	}
+	calls := 0
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		var q struct {
+			Input []string `json:"input"`
+		}
+		json.NewDecoder(r.Body).Decode(&q)
+		data := []any{}
+		for i := range q.Input {
+			data = append(data, map[string]any{"index": i, "embedding": []float64{1, 1, 1}})
+		}
+		json.NewEncoder(w).Encode(map[string]any{"data": data})
+	}))
+	defer api.Close()
+	f.s.Embed = &hub.Embedder{BaseURL: api.URL, Model: "optional", Dimensions: 3, BatchSize: 16, Timeout: time.Second}
+	if err = f.s.ConfigureIndex(f.ctx); err != nil {
+		t.Fatal("missing plugin prevented startup", err)
+	}
+	keyword := f.call("knowledge_search", hub.Params{Mode: "keyword", Query: "中文知识"})
+	if len(keyword.Data.([]hub.Hit)) != 1 {
+		t.Fatal("keyword unavailable")
+	}
+	hybrid := f.call("knowledge_search", hub.Params{Mode: "hybrid", Query: "中文知识"})
+	if len(hybrid.Data.([]hub.Hit)) != 1 || len(hybrid.Warnings) == 0 || !strings.Contains(hybrid.Warnings[0], "pgvector") {
+		t.Fatal("missing explicit fallback", hybrid)
+	}
+	_, err = f.s.Execute(f.ctx, f.actor, "knowledge_search", hub.Params{WorkspaceID: f.ws, Mode: "semantic", Query: "中文知识"})
+	code(t, err, "semantic_unavailable")
+	if calls != 0 {
+		t.Fatal("embedding API called without pgvector")
+	}
+	if _, err = f.s.ClaimJob(f.ctx); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatal("index work claimed without plugin", err)
+	}
+	var jobs int
+	if err = f.s.DB.QueryRow(`SELECT count(*) FROM index_jobs`).Scan(&jobs); err != nil || jobs != 0 {
+		t.Fatal("jobs enqueued without plugin", jobs, err)
+	}
+	f.call("knowledge_read", hub.Params{Ref: &k, Depth: 5})
 }

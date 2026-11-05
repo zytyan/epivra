@@ -27,7 +27,14 @@ func (s *Service) ConfigureIndex(ctx context.Context) error {
 	if _, err = tx.ExecContext(ctx, `UPDATE index_configs SET active=false WHERE active`); err != nil {
 		return err
 	}
-	if s.Embed != nil {
+	ready, err := vectorReady(ctx, tx)
+	if err != nil {
+		return err
+	}
+	if s.Embed != nil && !ready {
+		slog.Warn("semantic indexing disabled: pgvector is not enabled; keyword search remains available")
+	}
+	if s.Embed != nil && ready {
 		if err = s.Embed.Validate(); err != nil {
 			return err
 		}
@@ -46,17 +53,31 @@ func (s *Service) ClaimJob(ctx context.Context) (Job, error) {
 	if s.Embed == nil {
 		return j, sql.ErrNoRows
 	}
+	ready, err := vectorReady(ctx, s.DB)
+	if err != nil {
+		return j, err
+	}
+	if !ready {
+		return j, sql.ErrNoRows
+	}
 	// Exhausted leases are terminal even if a process died before recording failure.
 	if _, err := s.DB.ExecContext(ctx, `UPDATE index_jobs SET state='failed',last_error='lease expired after maximum attempts' WHERE state='running' AND lease_until<now() AND attempts>=5`); err != nil {
 		return j, err
 	}
-	err := s.DB.QueryRowContext(ctx, `WITH candidate AS (
+	err = s.DB.QueryRowContext(ctx, `WITH candidate AS (
  SELECT j.id FROM index_jobs j JOIN index_configs c ON c.fingerprint=j.fingerprint AND c.active
  WHERE j.fingerprint=$1 AND j.attempts<5 AND ((j.state='pending' AND j.available_at<=now()) OR (j.state='running' AND j.lease_until<now())) ORDER BY j.id FOR UPDATE OF j SKIP LOCKED LIMIT 1)
  UPDATE index_jobs j SET state='running',attempts=attempts+1,lease_until=now()+interval '2 minutes',lease_token=$2 FROM candidate c WHERE j.id=c.id RETURNING j.id,j.workspace_id,j.object_id,j.version,j.fingerprint,j.attempts`, s.Embed.Fingerprint(), j.Token).Scan(&j.ID, &j.WorkspaceID, &j.ObjectID, &j.Version, &j.Fingerprint, &j.Attempts)
 	return j, err
 }
 func (s *Service) RunJob(ctx context.Context, j Job) error {
+	ready, err := vectorReady(ctx, s.DB)
+	if err != nil {
+		return err
+	}
+	if !ready {
+		return fail("semantic_unavailable", "pgvector is not enabled")
+	}
 	// A lease heartbeat is separate from the external API call; ownership is checked again on commit.
 	taskCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -86,7 +107,7 @@ func (s *Service) RunJob(ctx context.Context, j Job) error {
 	defer func() { cancel(); <-heartbeatDone }()
 	var body string
 	var current int
-	err := s.DB.QueryRowContext(taskCtx, `SELECT r.body||E'\n'||r.conditions,o.current_version FROM revisions r JOIN objects o ON (o.workspace_id,o.id)=(r.workspace_id,r.object_id) WHERE r.workspace_id=$1 AND r.object_id=$2 AND r.version=$3`, j.WorkspaceID, j.ObjectID, j.Version).Scan(&body, &current)
+	err = s.DB.QueryRowContext(taskCtx, `SELECT r.body||E'\n'||r.conditions,o.current_version FROM revisions r JOIN objects o ON (o.workspace_id,o.id)=(r.workspace_id,r.object_id) WHERE r.workspace_id=$1 AND r.object_id=$2 AND r.version=$3`, j.WorkspaceID, j.ObjectID, j.Version).Scan(&body, &current)
 	chunks := Split(body)
 	var vectors [][]float64
 	if err == nil && current == j.Version {
@@ -119,7 +140,7 @@ func (s *Service) RunJob(ctx context.Context, j Job) error {
 			return err
 		}
 		for i, c := range chunks {
-			if _, err = tx.ExecContext(taskCtx, `INSERT INTO chunks(workspace_id,object_id,version,fingerprint,position,start_rune,content,embedding) VALUES($1,$2,$3,$4,$5,$6,$7,$8::vector)`, j.WorkspaceID, j.ObjectID, j.Version, j.Fingerprint, c.Position, c.Start, c.Text, marshal(vectors[i])); err != nil {
+			if _, err = tx.ExecContext(taskCtx, `INSERT INTO chunks(workspace_id,object_id,version,fingerprint,position,start_rune,content,embedding) VALUES($1,$2,$3,$4,$5,$6,$7,$8::public.vector)`, j.WorkspaceID, j.ObjectID, j.Version, j.Fingerprint, c.Position, c.Start, c.Text, marshal(vectors[i])); err != nil {
 				return err
 			}
 		}
@@ -146,6 +167,14 @@ func (s *Service) failJob(ctx context.Context, j Job, cause error) error {
 }
 func (s *Service) Worker(ctx context.Context) {
 	if s.Embed == nil {
+		return
+	}
+	ready, err := vectorReady(ctx, s.DB)
+	if err != nil {
+		slog.Error("vector capability check failed", "error", err)
+		return
+	}
+	if !ready {
 		return
 	}
 	ticker := time.NewTicker(time.Second)

@@ -62,12 +62,12 @@ func (s *Service) search(ctx context.Context, tx *sql.Tx, p Params) (Result, err
 	warnings := []string{}
 	semanticOK := false
 	if p.Mode != "keyword" && strings.TrimSpace(p.Query) != "" {
-		vectors, err := s.Embed.Vectors(ctx, []string{p.Query})
+		vectors, err := s.queryVector(ctx, tx, p.Query)
 		if err != nil {
 			if p.Mode == "semantic" {
 				return Result{}, err
 			}
-			warnings = append(warnings, "semantic_unavailable: using keyword search")
+			warnings = append(warnings, err.Error()+"; using keyword search")
 		} else {
 			fp := s.Embed.Fingerprint()
 			var active bool
@@ -81,7 +81,7 @@ func (s *Service) search(ctx context.Context, tx *sql.Tx, p Params) (Result, err
 				warnings = append(warnings, "semantic_unavailable: model configuration changed; using keyword search")
 			} else {
 				rows, err := tx.QueryContext(ctx, `SELECT kind,id,version,content,score,pending,position FROM (
- SELECT DISTINCT ON(o.id) o.kind,o.id,r.version,c.content,1-(c.embedding <=> $6::vector) AS score,`+pendingSQL+` AS pending,c.position FROM objects o JOIN revisions r ON (r.workspace_id,r.object_id,r.version)=(o.workspace_id,o.id,o.current_version) JOIN chunks c ON (c.workspace_id,c.object_id,c.version)=(r.workspace_id,r.object_id,r.version) WHERE `+filters+` AND c.fingerprint=$5 ORDER BY o.id,c.embedding <=> $6::vector,c.position) q ORDER BY score DESC,id LIMIT $7`, p.WorkspaceID, marshal(p.Types), marshal(p.Tags), p.PendingReview, fp, marshal(vectors[0]), candidateLimit)
+ SELECT DISTINCT ON(o.id) o.kind,o.id,r.version,c.content,1-(c.embedding <=> $6::public.vector) AS score,`+pendingSQL+` AS pending,c.position FROM objects o JOIN revisions r ON (r.workspace_id,r.object_id,r.version)=(o.workspace_id,o.id,o.current_version) JOIN chunks c ON (c.workspace_id,c.object_id,c.version)=(r.workspace_id,r.object_id,r.version) WHERE `+filters+` AND c.fingerprint=$5 ORDER BY o.id,c.embedding <=> $6::public.vector,c.position) q ORDER BY score DESC,id LIMIT $7`, p.WorkspaceID, marshal(p.Types), marshal(p.Tags), p.PendingReview, fp, marshal(vectors[0]), candidateLimit)
 				if err != nil {
 					return Result{}, err
 				}
@@ -164,4 +164,24 @@ func RRF(lists ...[]Hit) []Hit {
 		return out[i].Score > out[j].Score
 	})
 	return out
+}
+
+// Capability detection does not reference a vector type or a missing table in
+// parsed SQL, so it is safe on PostgreSQL installations without pgvector.
+func vectorReady(ctx context.Context, q interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}) (bool, error) {
+	var ready bool
+	err := q.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM pg_extension e JOIN pg_namespace n ON n.oid=e.extnamespace WHERE e.extname='vector' AND n.nspname='public') AND EXISTS(SELECT 1 FROM pg_attribute WHERE attrelid=to_regclass(format('%I.chunks',current_schema())) AND attname='embedding' AND atttypid=to_regtype('public.vector') AND NOT attisdropped)`).Scan(&ready)
+	return ready, err
+}
+func (s *Service) queryVector(ctx context.Context, tx *sql.Tx, query string) ([][]float64, error) {
+	ready, err := vectorReady(ctx, tx)
+	if err != nil {
+		return nil, err
+	}
+	if !ready {
+		return nil, fail("semantic_unavailable", "pgvector is not enabled; initialize a fresh database with the extension enabled to use semantic search")
+	}
+	return s.Embed.Vectors(ctx, []string{query})
 }

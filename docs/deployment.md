@@ -4,7 +4,7 @@
 
 ## PostgreSQL 准备
 
-数据库服务器安装 PostgreSQL 16/17、pgvector 0.8.0+ 和 pg_trgm。pgvector 的安装方式见[官方安装说明](https://github.com/pgvector/pgvector/tree/v0.8.0#installation)，pg_trgm 通常随 PostgreSQL 的 contrib 包提供。扩展必须安装在数据库服务器上。
+数据库服务器安装 PostgreSQL 16/17 和 pg_trgm。pgvector 0.8.0+ 是可选依赖，仅用于语义检索；安装方式见[官方安装说明](https://github.com/pgvector/pgvector/tree/v0.8.0#installation)，pg_trgm 通常随 PostgreSQL 的 contrib 包提供。扩展必须安装在数据库服务器上。
 
 使用数据库管理员创建应用角色和数据库（密码请替换）：
 
@@ -16,12 +16,23 @@ CREATE DATABASE knowledgehub OWNER knowledgehub;
 连接 knowledgehub 数据库，由管理员执行：
 
 ```sql
-CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA public;
 CREATE EXTENSION IF NOT EXISTS pg_trgm WITH SCHEMA public;
 GRANT USAGE, CREATE ON SCHEMA public TO knowledgehub;
 ```
 
-应用角色需要拥有其业务表，并有创建表、函数、触发器等迁移权限。管理员预先安装扩展后，应用角色不需要超级用户权限。默认业务对象创建在 search_path 的首个 schema；连接的 search_path 必须包含 public，以便解析扩展类型和函数。
+没有 pgvector 时，上述准备即可运行全部知识闭环和关键词检索。无需配置 Embedding；即使已经配置，服务也会关闭语义索引，不发送 Embedding 请求。显式 semantic 查询返回 `semantic_unavailable`，hybrid 返回关键词结果和说明插件未启用的警告。
+
+需要语义检索时，应在新测试库初始化之前由管理员执行：
+
+```sql
+CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA public;
+```
+
+然后配置 EMBEDDING_BASE_URL 等变量，运行 `init-db` 或 `serve`。程序不会自动安装 pgvector，只在新库初始化时检测 public schema 中已启用的扩展，并决定是否创建向量表。
+
+测试阶段没有版本迁移和旧库兼容逻辑。已有测试库修改结构或切换 pgvector 能力时，需要自行重建测试库再初始化；应用启动不会更新旧结构，也不会自动清空数据。
+
+应用角色需要拥有其业务表，并有创建表、函数、触发器等初始化权限。管理员预先安装所需扩展后，应用角色不需要超级用户权限。默认业务对象创建在 search_path 的首个 schema；连接的 search_path 必须包含 public，以便解析扩展类型和函数。
 
 ## 构建与运行
 
@@ -29,13 +40,13 @@ GRANT USAGE, CREATE ON SCHEMA public TO knowledgehub;
 ./scripts/build.sh
 export DATABASE_URL='postgres://knowledgehub:replace_me@db-host:5432/knowledgehub?sslmode=verify-full'
 export LISTEN_ADDR=127.0.0.1:8080
-./bin/knowledgehub migrate
+./bin/knowledgehub init-db
 ./bin/knowledgehub serve
 ```
 
 DATABASE_URL 中的密码若含 URL 保留字符，须进行 URL 编码。仅本机测试可使用 sslmode=disable；远程连接按数据库部署配置证书、sslmode、sslrootcert 等连接参数。CLI 和服务使用相同的环境变量。
 
-所有迁移已嵌入程序；复制单个 bin/knowledgehub 即可部署。不加载相对目录中的配置文件。可用进程管理器注入环境变量，或从可信 shell 文件加载 `.env.example` 的副本后启动程序。标准输出用于 CLI 结果，结构化日志写入标准错误。SIGTERM/SIGINT 执行正常关闭。
+所有初始化已嵌入程序；复制单个 bin/knowledgehub 即可部署。不加载相对目录中的配置文件。可用进程管理器注入环境变量，或从可信 shell 文件加载 `.env.example` 的副本后启动程序。标准输出用于 CLI 结果，结构化日志写入标准错误。SIGTERM/SIGINT 执行正常关闭。
 
 ## 环境变量
 

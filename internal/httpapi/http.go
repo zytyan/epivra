@@ -95,9 +95,9 @@ func Register(mux *http.ServeMux, s *hub.Service) {
 	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 		defer cancel()
-		var n int
-		err := s.DB.QueryRowContext(ctx, `SELECT version FROM schema_migrations WHERE version=1`).Scan(&n)
-		if err != nil {
+		var initialized bool
+		err := s.DB.QueryRowContext(ctx, `SELECT to_regclass(format('%I.workspaces',current_schema())) IS NOT NULL`).Scan(&initialized)
+		if err != nil || !initialized {
 			JSON(w, 503, map[string]string{"status": "not_ready"})
 			return
 		}
