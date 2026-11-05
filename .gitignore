@@ -1,0 +1,6 @@
+.env
+/knowledgehub
+*.test
+coverage.out
+__pycache__/
+*.pyc

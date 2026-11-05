@@ -1,0 +1,45 @@
+services:
+  db:
+    image: pgvector/pgvector:0.8.0-pg17
+    environment:
+      POSTGRES_DB: knowledgehub
+      POSTGRES_USER: knowledgehub
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U knowledgehub -d knowledgehub"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+  app:
+    build: .
+    environment:
+      DATABASE_URL: postgres://knowledgehub:${POSTGRES_PASSWORD}@db:5432/knowledgehub?sslmode=disable
+      LISTEN_ADDR: :8080
+      MAX_UPLOAD_BYTES: ${MAX_UPLOAD_BYTES:-20971520}
+      MCP_PATH: ${MCP_PATH:-/mcp}
+      MCP_SSE_PATH: ${MCP_SSE_PATH:-/sse}
+      MCP_MESSAGES_PATH: ${MCP_MESSAGES_PATH:-/messages}
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-}
+      TRUSTED_ORIGINS: ${TRUSTED_ORIGINS:-}
+      EMBEDDING_BASE_URL: ${EMBEDDING_BASE_URL:-}
+      EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-text-embedding-3-small}
+      EMBEDDING_DIMENSIONS: ${EMBEDDING_DIMENSIONS:-1536}
+      EMBEDDING_TIMEOUT: ${EMBEDDING_TIMEOUT:-30s}
+      EMBEDDING_BATCH_SIZE: ${EMBEDDING_BATCH_SIZE:-16}
+    ports:
+      - "127.0.0.1:${PORT:-8080}:8080"
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "knowledgehub", "healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+    restart: unless-stopped
+volumes:
+  postgres_data:
