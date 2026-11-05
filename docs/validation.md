@@ -9,8 +9,10 @@
 - 检索测试使用模拟 HTTP Embedding 服务，覆盖中文子串、标签、未配置时降级、索引滞后、旧任务、模型/维度切换、API 失败和有限重试。
 - MCP 实际 HTTP 测试覆盖 SSE 2024-11-05 与 Streamable HTTP 2025-11-25 的初始化、发现、写入、检索、图片读取、断开重连、自定义路径、Origin、会话调用者隔离和撤销密钥。
 - REST multipart 上传、二进制下载、只读密钥验证通过。
-- OpenAPI 重新生成与仓库文件一致，Compose 配置校验通过。
+- OpenAPI 重新生成与仓库文件一致。
 
 Embedding 使用模拟服务验证接口和失败路径，未调用付费模型接口。首版向量检索采用精确扫描，大规模语料的性能和多实例 MCP 会话路由未做容量验证。
 
-Docker 镜像构建通过。独立运行 CLI、API 服务、healthcheck 和 `scripts/agent-example.py` 通过；示例成功创建 Knowledge 版本 2、读取版本 1，并保留相反评估。
+独立二进制部署取代原容器交付。独立运行 CLI、API 服务、healthcheck 和 `scripts/agent-example.py` 通过；示例成功创建 Knowledge 版本 2、读取版本 1，并保留相反评估。
+
+独立部署验证：`./scripts/build.sh` 生成 bin/knowledgehub，file/ldd 确认静态链接。使用直接运行的 PostgreSQL 17.11 + pgvector 0.8.0 执行 `./scripts/test-integration.sh`，全项目 race 测试通过。将单个二进制复制到临时目录，不携带源码、配置或迁移文件，通过环境变量及预装扩展的普通数据库角色执行迁移、CLI、serve、healthcheck 和完整 Agent 示例，均通过。

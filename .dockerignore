@@ -1,9 +1,0 @@
-.git
-.agents
-.aws
-.codex
-.env
-*.test
-/knowledgehub
-__pycache__
-*.pyc

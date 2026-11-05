@@ -4,29 +4,31 @@ permissions:
   contents: read
 jobs:
   test:
-    runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: pgvector/pgvector:0.8.0-pg17
-        env:
-          POSTGRES_USER: test
-          POSTGRES_PASSWORD: test
-          POSTGRES_DB: knowledgehub_test
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U test -d knowledgehub_test"
-          --health-interval 2s --health-timeout 3s --health-retries 30
+    runs-on: ubuntu-24.04
     env:
-      TEST_DATABASE_URL: postgres://test:test@127.0.0.1:5432/knowledgehub_test?sslmode=disable
+      TEST_DATABASE_URL: postgres://test:test@127.0.0.1:5433/knowledgehub_test?sslmode=disable
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version: '1.26.5'
           cache: true
+      - name: Prepare standalone PostgreSQL and pgvector
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-16 postgresql-server-dev-16 build-essential
+          git clone --depth 1 --branch v0.8.0 https://github.com/pgvector/pgvector.git "$RUNNER_TEMP/pgvector"
+          make -C "$RUNNER_TEMP/pgvector" PG_CONFIG=/usr/lib/postgresql/16/bin/pg_config
+          sudo make -C "$RUNNER_TEMP/pgvector" PG_CONFIG=/usr/lib/postgresql/16/bin/pg_config install
+          sudo pg_createcluster 16 epivra --port 5433 --start
+          sudo -u postgres psql -p 5433 -v ON_ERROR_STOP=1 -c "CREATE ROLE test LOGIN SUPERUSER PASSWORD 'test'"
+          sudo -u postgres createdb -p 5433 -O test knowledgehub_test
       - run: go mod download
       - run: go vet ./...
-      - run: go test -race -count=1 ./...
+      - run: ./scripts/test-integration.sh
       - run: go run ./cmd/openapi > /tmp/openapi.json && diff -u docs/openapi.json /tmp/openapi.json
-      - run: docker build -t epivra:ci .
+      - run: ./scripts/build.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: knowledgehub-linux-amd64
+          path: bin/knowledgehub

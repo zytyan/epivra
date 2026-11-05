@@ -4,3 +4,7 @@
 coverage.out
 __pycache__/
 *.pyc
+
+/bin/
+
+/.build-cache/

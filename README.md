@@ -4,24 +4,34 @@ Go + PostgreSQL 的 Agent 知识库：Source → Claim → Verification → Asse
 
 ## 启动
 
-需要 Docker Engine 和 Compose v2。运行两个服务：Go API/MCP/worker，以及带 pgvector、pg_trgm 的 PostgreSQL 17。
+需要 Go 1.25+ 编译；运行时只需二进制和独立部署的 PostgreSQL（16/17），数据库需安装 pgvector 0.8.0+ 和 pg_trgm。数据库迁移已嵌入二进制，无需携带源码或迁移文件。
 
 ```sh
-cp .env.example .env
-# 编辑 .env，将 POSTGRES_PASSWORD 替换为随机的 URL-safe 密码。
-docker compose up -d --build
-docker compose exec app knowledgehub workspace-create --name research
+./scripts/build.sh
+# 也可以直接编译：
+CGO_ENABLED=0 go build -mod=readonly -trimpath -o bin/knowledgehub ./cmd/knowledgehub
+
+export DATABASE_URL='postgres://knowledgehub:your_password@127.0.0.1:5432/knowledgehub?sslmode=disable'
+export LISTEN_ADDR=127.0.0.1:8080
+./bin/knowledgehub migrate
+./bin/knowledgehub workspace-create --name research
 # 将上一步 workspace_id 填入下一条命令。
-docker compose exec app knowledgehub key-issue --workspace WORKSPACE_UUID --name agent-1 --write
+./bin/knowledgehub key-issue --workspace WORKSPACE_UUID --name agent-1 --write
+./bin/knowledgehub serve
 ```
+
+编译产物是 `bin/knowledgehub`，可单独复制到相同操作系统/架构的机器运行，不依赖 Go、C 运行库或 PostgreSQL 客户端。交叉编译示例：`GOOS=linux GOARCH=arm64 ./scripts/build.sh`。所有运行配置通过环境变量传入，见 [.env.example](.env.example)；程序不自动读取 .env。需要从文件载入时，在可信的 shell 环境文件中填写配置后运行 `set -a; . ./.env; set +a`。
+
+PostgreSQL 的独立部署、数据库权限及完整环境变量说明见 [部署文档](docs/deployment.md)。`serve` 启动时也会自动执行迁移；建议首次上线先用 `migrate` 完成数据库准备。
 
 API Key 只在发放时输出一次，数据库保存 SHA-256 摘要。每个 Agent 单独发放；不加 `--write` 得到只读密钥。撤销：
 
 ```sh
-docker compose exec app knowledgehub key-revoke --id KEY_UUID
+./bin/knowledgehub key-revoke --id KEY_UUID
+./bin/knowledgehub healthcheck
 ```
 
-默认只将 API 暴露到本机 `127.0.0.1:8080`。`/healthz` 检查进程，`/readyz` 检查数据库及迁移。远程访问时在反向代理终止 TLS，并设置 `PUBLIC_BASE_URL`、`TRUSTED_ORIGINS`；SSE 代理应关闭响应缓冲。数据库使用 Compose volume 持久化，附件也在数据库中，备份 PostgreSQL 即包含所有业务数据。
+示例配置监听 `127.0.0.1:8080`；省略 LISTEN_ADDR 时监听 `:8080`。`/healthz` 检查进程，`/readyz` 检查数据库及迁移。远程访问时在反向代理终止 TLS，并设置 `PUBLIC_BASE_URL`、`TRUSTED_ORIGINS`；SSE 代理应关闭响应缓冲。附件也在数据库中，备份 PostgreSQL 即包含所有业务数据。
 
 ## 接口
 
@@ -57,7 +67,7 @@ docker compose exec app knowledgehub key-revoke --id KEY_UUID
 
 默认 `hybrid`，支持 `keyword`、`semantic`。全文、trigram 和子串匹配支持中文片段；标签过滤要求包含所有给定标签。语义覆盖 Source、Claim、Knowledge 当前修订的正文及适用条件，按 Unicode 字符分块（800 字符，重叠 100），不执行抓取或 OCR；图片说明应写入 Source 正文。
 
-设置 `.env` 的 `EMBEDDING_BASE_URL`（包含服务的 `/v1`）、`EMBEDDING_API_KEY`、`EMBEDDING_MODEL`、`EMBEDDING_DIMENSIONS`。接口为 OpenAI 兼容的 `/embeddings`；配置见 [.env.example](.env.example)。不配置时关键词仍可用；显式语义请求返回 `semantic_unavailable`，混合查询返回关键词结果及降级警告。
+通过环境变量设置 `EMBEDDING_BASE_URL`（包含服务的 `/v1`）、`EMBEDDING_API_KEY`、`EMBEDDING_MODEL`、`EMBEDDING_DIMENSIONS`。接口为 OpenAI 兼容的 `/embeddings`；配置见 [.env.example](.env.example)。不配置时关键词仍可用；显式语义请求返回 `semantic_unavailable`，混合查询返回关键词结果及降级警告。
 
 模型、维度、端点或分块配置变化会改变指纹，重启后为所有当前修订入队重建。不同指纹的向量不混用。查询未完成索引时返回 `index_incomplete`。混合检索以 RRF（常数 60）合并候选排名。首版向量距离精确扫描，未增加需要固定维度的 ANN 索引。
 
@@ -65,20 +75,15 @@ worker 用 `SKIP LOCKED`、两分钟租约、30 秒续租、独立令牌和最�
 
 ## 开发与测试
 
-需要 Go 1.25+；容器构建使用 Go 1.26.5。官方 MCP Go SDK 锁定 v1.5.0，兼容测试基线是 SSE `2024-11-05` 和 Streamable HTTP `2025-11-25`。
+需要 Go 1.25+；CI 使用 Go 1.26.5。官方 MCP Go SDK 锁定 v1.5.0，兼容测试基线是 SSE `2024-11-05` 和 Streamable HTTP `2025-11-25`。
 
 ```sh
 go mod download
 go vet ./...
 go test -race ./...
 # 上述命令在没有 TEST_DATABASE_URL 时会显式跳过数据库集成测试。
-./scripts/test-integration.sh
-```
-
-集成脚本使用独立 Compose 项目和临时数据库，结束后销毁测试容器。也可以用现有的**专用测试库**：
-
-```sh
-TEST_DATABASE_URL='postgres://test:test@localhost:5432/knowledgehub_test?sslmode=disable' go test -race -count=1 ./...
+# 对单独部署的专用测试数据库运行完整集成测试：
+TEST_DATABASE_URL='postgres://test:test@localhost:5432/knowledgehub_test?sslmode=disable' ./scripts/test-integration.sh
 ```
 
 测试为每个用例创建独立 schema，要求创建 schema/extension 的权限；需要 pgvector 和 pg_trgm。覆盖数据库不可变约束、证据固定、冲突评估、权限/跨 Workspace、幂等/CAS 并发、复审与新事件竞争、租约恢复、模型切换、中文检索、失败降级，以及两种 MCP 协议的实际 HTTP 初始化、发现、写入、读取和重新连接。
