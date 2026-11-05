@@ -5,9 +5,6 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-24.04
-    strategy:
-      matrix:
-        pgvector: [false, true]
     env:
       TEST_DATABASE_URL: postgres://test:test@127.0.0.1:5433/knowledgehub_test?sslmode=disable
     steps:
@@ -23,14 +20,6 @@ jobs:
           sudo pg_createcluster 16 epivra --port 5433 --start
           sudo -u postgres psql -p 5433 -v ON_ERROR_STOP=1 -c "CREATE ROLE test LOGIN SUPERUSER PASSWORD 'test'"
           sudo -u postgres createdb -p 5433 -O test knowledgehub_test
-      - name: Enable optional pgvector
-        if: matrix.pgvector
-        run: |
-          sudo apt-get install -y postgresql-server-dev-16 build-essential
-          git clone --depth 1 --branch v0.8.0 https://github.com/pgvector/pgvector.git "$RUNNER_TEMP/pgvector"
-          make -C "$RUNNER_TEMP/pgvector" PG_CONFIG=/usr/lib/postgresql/16/bin/pg_config
-          sudo make -C "$RUNNER_TEMP/pgvector" PG_CONFIG=/usr/lib/postgresql/16/bin/pg_config install
-          sudo -u postgres psql -p 5433 -d knowledgehub_test -v ON_ERROR_STOP=1 -c "CREATE EXTENSION vector WITH SCHEMA public"
       - run: go mod download
       - run: go vet ./...
       - run: ./scripts/test-integration.sh
@@ -38,5 +27,5 @@ jobs:
       - run: ./scripts/build.sh
       - uses: actions/upload-artifact@v4
         with:
-          name: knowledgehub-linux-amd64-pgvector-${{ matrix.pgvector }}
+          name: knowledgehub-linux-amd64
           path: bin/knowledgehub

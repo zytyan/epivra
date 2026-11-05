@@ -11,9 +11,6 @@ import (
 //go:embed core.sql
 var core string
 
-//go:embed vector.sql
-var vector string
-
 func Initialize(ctx context.Context, db *sql.DB) error {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
@@ -24,7 +21,7 @@ func Initialize(ctx context.Context, db *sql.DB) error {
 		return err
 	}
 	var initialized bool
-	if err = tx.QueryRowContext(ctx, `SELECT to_regclass(format('%I.workspaces',current_schema())) IS NOT NULL`).Scan(&initialized); err != nil {
+	if err = tx.QueryRowContext(ctx, `SELECT to_regclass(format('%I.knowledge',current_schema())) IS NOT NULL`).Scan(&initialized); err != nil {
 		return err
 	}
 	if initialized {
@@ -32,15 +29,6 @@ func Initialize(ctx context.Context, db *sql.DB) error {
 	}
 	if _, err = tx.ExecContext(ctx, core); err != nil {
 		return fmt.Errorf("initialize schema: %w", err)
-	}
-	var installed bool
-	if err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM pg_extension e JOIN pg_namespace n ON n.oid=e.extnamespace WHERE e.extname='vector' AND n.nspname='public')`).Scan(&installed); err != nil {
-		return err
-	}
-	if installed {
-		if _, err = tx.ExecContext(ctx, vector); err != nil {
-			return fmt.Errorf("initialize vector schema: %w", err)
-		}
 	}
 	return tx.Commit()
 }

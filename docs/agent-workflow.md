@@ -1,27 +1,26 @@
-# Agent 操作闭环
+# 客户端 Dream 会话
 
-准备好 Workspace 与写入 API Key 后，可以运行真正调用 REST 的示例：
+正常工作只向 Agent 暴露 `/mcp`，客户端保存本地会话历史。Dream 的调度、LLM、输入窗口和历史游标都由客户端管理，服务不自动安排整理任务。
+
+一次增量 Dream：
+
+1. 客户端加载尚未分析的本地历史，在独立上下文中连接 `/mcp/write`。
+2. search 适用 scope 下的已有 Knowledge；必要时另查 scope={} 的通用知识，自行判断是否适用。跨版本比较需显式查询，不推断新软件知识更正确。
+3. read 候选知识的全文、来源和历史。若已被完整覆盖则忽略，不写入。
+4. 对有价值的新观察，save Source，保存对应历史片段和来源位置。
+5. 新原子事实或不同软件版本的独立事实：save Knowledge，不带 id。修正一个已存在的事实：save 指定 id、expected_revision、完整 scope/来源及 reason。
+6. 遇到 revision_conflict，重新读取，再判断新增、修订或忽略；不能盲目覆盖。网络失败使用同一幂等键和参数重试。
+7. 客户端保存处理进度，结束 Dream 会话；下一次普通会话仍只连接 `/mcp`。
+
+服务不自动选择修订对象、不去重、不给评估结论，也不记录 Dream 的执行阶段。search.since 仅供辅助筛选，不能替代客户端历史游标。
+
+可执行的 REST 示例（与 MCP 调用相同业务逻辑）验证 Source→Knowledge 闭环、不同软件版本并存，以及旧软件 Knowledge 的独立修订：
 
 ```sh
 export BASE_URL=http://localhost:8080
 export WORKSPACE_ID=WORKSPACE_UUID
-export API_KEY=YOUR_API_KEY
+export API_KEY=WRITE_API_KEY
 python3 scripts/agent-example.py
 ```
 
-脚本每次使用新的幂等键，会在指定 Workspace 中保留示例业务数据。流程是：
-
-1. `source_create` 保存实验原始信息，说明来源和类型。
-2. `claim_create` 从 Source 提取主张，标明适用条件。
-3. `verification_create` 固定到 Claim 版本 1，并用 output_source 原子保存重复实验结果。
-4. `assessment_create` 汇总同一 Claim 修订的 Verification，给出有条件的支持结论。
-5. `knowledge_publish` 明确引用 Claim 版本 1 和支持 Assessment。
-6. 新增反例 Source、反驳 Verification 与 Assessment，保留两种相反评估。
-7. `knowledge_read` 读取复审事件；Agent 评判条件差异后，用 expected_version=1 发布 Knowledge 版本 2，明确列出已处理的 resolve_events。
-8. 再次读取 Knowledge 版本 1，验证旧正文及固定证据链仍可追溯。
-
-MCP 调用同名工具、使用相同 arguments，即可执行同一流程。对可重试的网络失败保留原幂等键及原参数，重新发送；对版本冲突先读取新版本，再决定如何修改，不能把 expected_version 自动替换后盲目重试。
-
-待复审工作队列由 `knowledge_search` 的 `types:["knowledge"]`、`pending_review:true` 得到。逐条读取 review_events、相关 Assessment 和固定版本证据；列表超过 limit 时继续分页。Agent 的 Assessment 或 Knowledge 修订只携带实际处理的事件 ID。处理过程中再到达的事件保持未关闭。
-
-未关联的 Source 通过定期 keyword/hybrid 检索发现。服务不把新 Source 自动关联到主张，也不使用“最后一次评估”覆盖已有判断。Claim 正文发生变化时先 `claim_revise`，再针对新修订进行验证和评估，最后显式修订 Knowledge 的依据；旧 Knowledge 仍指向原 Claim 修订。
+示例会新增测试数据；它演示明确操作，不调用模型，也不模拟自动正确性判断。

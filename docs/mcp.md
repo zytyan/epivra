@@ -1,40 +1,30 @@
 # MCP 连接
 
-服务使用[官方 Go SDK v1.5.0](https://github.com/modelcontextprotocol/go-sdk/tree/v1.5.0)，其[协议版本列表](https://github.com/modelcontextprotocol/go-sdk/blob/v1.5.0/mcp/shared.go)包含 2024-11-05 和 2025-11-25。双端点遵循[官方双协议兼容说明](https://github.com/modelcontextprotocol/modelcontextprotocol/blob/main/docs/specification/2025-03-26/basic/transports.mdx)。
+使用官方 Go SDK v1.5.0，Streamable HTTP 协议基线 2025-11-25。两个默认端点：
 
-| 传输 | 默认入口 | 兼容测试基线 |
-|---|---|---|
-| Streamable HTTP | `http://localhost:8080/mcp` | `2025-11-25` |
-| 旧 SSE | GET `http://localhost:8080/sse`，随后使用 endpoint 事件给出的 POST URL | `2024-11-05` |
+- `/mcp`：只读，发现和调用 search、read。
+- `/mcp/write`：读写，发现和调用 search、read、save。
 
-所有 HTTP 请求都必须携带 `Authorization: Bearer API_KEY`，包括 SSE 建连和 POST 消息。旧版 POST 默认是 `/messages?session_id=...`；客户端必须使用 endpoint 事件中的地址。Streamable HTTP 客户端保存 Mcp-Session-Id，后续请求附带该头及 Mcp-Protocol-Version。不同 API Key 不能重用另一调用者的会话；撤销 Key 后，既有会话后续调用也拒绝。
+客户端在正常会话只配置 `/mcp`；Dream 使用独立会话连接 `/mcp/write`。不要把可写端点默认挂到正常工作会话。端点控制工具可见性；API Key 仍控制 Workspace 读写权限。只读 Key 即使连接 `/mcp/write` 也无法保存。写 Key 在 `/mcp` 也不能调用 save。
 
-Streamable HTTP 初始化示例：
+所有请求携带 `Authorization: Bearer API_KEY`。初始化：
 
 ```sh
 curl -i http://localhost:8080/mcp \
   -H "Authorization: Bearer $API_KEY" \
   -H 'Content-Type: application/json' \
   -H 'Accept: application/json, text/event-stream' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"example-agent","version":"1"}}}'
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"agent","version":"1"}}}'
 ```
 
-获得会话头后发送 `notifications/initialized`，再调用 `tools/list`、`tools/call`。工具参数与 REST JSON 相同，例如：
+保存响应的 Mcp-Session-Id，后续请求携带同一头以及 `Mcp-Protocol-Version: 2025-11-25`。发送 notifications/initialized 后调用 tools/list 或 tools/call：
 
 ```json
-{
-  "jsonrpc": "2.0",
-  "id": 2,
-  "method": "tools/call",
-  "params": {
-    "name": "knowledge_search",
-    "arguments": {"workspace_id":"WORKSPACE_UUID","query":"实验","mode":"keyword"}
-  }
-}
+{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"search","arguments":{"workspace_id":"UUID","query":"缓存","scope":{"software":{"version":"2.4"}}}}}
 ```
 
-成功结果位于 MCP `result.content[0].text`，其文本是统一业务结果的 JSON。业务错误以 `result.isError=true` 和包含 error 的 text content 返回；协议层错误由 SDK 使用 JSON-RPC error 返回。读取 PNG/JPEG/WebP/GIF 附件时追加 image content，text 只保留附件元信息；其他二进制按需返回 base64。
+成功的业务 JSON 位于 result.content[0].text。业务错误返回 isError=true；不可见工具调用由 SDK 返回 JSON-RPC error。图片附件读取可追加 image content。
 
-`MCP_PATH`、`MCP_SSE_PATH`、`MCP_MESSAGES_PATH` 可独立配置，不得重叠。`PUBLIC_BASE_URL` 决定 SSE 广播的外部消息地址（可包含代理前缀）；为空时使用相对路径。`TRUSTED_ORIGINS` 是逗号分隔的精确 Origin 列表，默认拒绝所有带 Origin 的请求，允许普通 CLI Agent 的无 Origin 请求。
+会话按端点和 API Key 隔离，不能把 `/mcp/write` 的会话带到 `/mcp`，也不能使用另一个 Key 重用会话。每个 HTTP 请求都检查密钥；撤销后既有会话的后续请求也被拒绝。空闲会话 30 分钟过期，进程退出后不恢复，客户端重新初始化并按原幂等键重试不确定的保存。
 
-Streamable HTTP 空闲会话 30 分钟过期。连接断开后可重新 initialize；业务幂等键可安全恢复不确定是否成功的写入。进程退出后会话不恢复，多实例部署需要 MCP 会话粘性路由；首版按单实例部署。
+`MCP_READ_PATH` 和 `MCP_WRITE_PATH` 可修改端点路径。`TRUSTED_ORIGINS` 指定逗号分隔的精确 Origin；默认拒绝带 Origin 的浏览器请求，普通 CLI 无 Origin 请求可用。

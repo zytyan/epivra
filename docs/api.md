@@ -1,58 +1,59 @@
-# API 与一致性约定
+# 三个操作
 
-API 接受 JSON，未知字段和显式 null 拒绝；可选字段请省略。时间为 RFC3339，读取以 UTC 输出。成功返回 `{"data":...,"warnings":[],"page":{"limit":20,"offset":0,"has_more":false}}`，非列表操作省略 page。失败返回 `{"error":{"code":"version_conflict","message":"...","details":{"current_version":2}}}`。
+MCP 工具和 `POST /v1/{search|read|save}` 使用相同 JSON 参数。所有调用要求 workspace_id 和 Bearer API Key。未知字段、显式顶层 null、旧接口参数均拒绝；可选字段请省略。
 
-| HTTP | 错误码 |
-|---|---|
-| 400 | `invalid_input`、`invalid_reference` |
-| 401 | `unauthorized` |
-| 403 | `forbidden` |
-| 404 | `not_found`、`unknown_operation` |
-| 409 | `version_conflict`、`idempotency_conflict`、`conflict` |
-| 413 | `upload_too_large` |
-| 500 | `internal` |
-| 503 | `semantic_unavailable` |
+成功返回 `{"data":...,"warnings":[],"page":...}`；错误为 `{"error":{"code":"revision_conflict","message":"...","details":{"current_revision":2}}}`。HTTP 401/403 表示认证/权限失败，404 表示不存在，409 表示修订或幂等冲突，413 表示上传超限，其他输入错误为 400。
 
-`conflict` 表示数据库并发冲突，可用原幂等键重试。`version_conflict` 应先读取最新版本，再判断是否修订，并为新的请求选择新的幂等键。幂等性比较规范化的完整参数，数组顺序有意义；不要用同一键提交不同内容。
+## save
 
-对象引用为 `{"type":"claim","id":"UUID","version":1}`。Source 引用可以省略 version，写入时解析并固定当时的当前版本；Claim、Verification、Assessment 历史依据必须提供 version。读取 ref 时省略 version 或设为 0 表示当前版本。写入结果 data 是新对象的 `{type,id,version}`。
-
-`knowledge_publish` 不传 id 时创建；传 id 时必须传 expected_version、reason。每次修订是完整快照，必须重新提供正文、标签、适用条件和全部依据；不会合并旧字段。`source_tags_update` 的 tags 是替换数组，可为空数组。
-
-`knowledge_read` 支持所有对象类型。data 包含 revision、links、attachments、evidence、assessments、review_events。默认 depth=0，返回正文、直接关系和固定证据链上的附件清单，不返回附件二进制。depth=1..5 展开固定版本证据。`assessments` 是对应 Claim 修订的全部评估，可包含发布后新增的相反评估；它们不是原发布依据，原依据始终由固定的 links/evidence 表示。
-
-limit 默认 20、最大 100，offset 默认 0、最大 100000。外层 page 描述 evidence 分页；links_page、attachments_page、related_page、review_page 分别描述其他列表。相同 limit/offset 应用于每个列表，依据各自 has_more 继续翻页。历史按根对象选定版本返回其修订及相关验证和评估；后来新增的评估仍可查询，不会替换历史依据。
-
-复审事件带 `id`、`claim_id`、`cause_id`、`cause_version`、`event_type` 和时间。读取 Knowledge 返回该对象未关闭事件；读取 Claim 返回未经 Assessment 确认的事件。Assessment 或 Knowledge 写入 `resolve_events:["EVENT_UUID"]` 只关闭这些事件。不能用其他 Workspace 或无关 Claim 的事件。确认依据保存在追加式 event_resolutions 中。
-
-## 附件
-
-MCP/JSON 使用 `attachments:[{"name":"result.txt","mime":"text/plain","data":"BASE64"}]`。默认一次 Source 的附件总大小限制为 20 MiB，通过 MAX_UPLOAD_BYTES 配置；正文另限 4 MiB。不自动抓取 provenance 中的 URL。
-
-REST multipart 的 metadata 字段是完整 source_create 参数的 JSON，附件用重复的 attachments 字段：
-
-```sh
-curl -H "Authorization: Bearer $API_KEY" \
-  -F "metadata={\"workspace_id\":\"$WORKSPACE_ID\",\"idempotency_key\":\"upload-1\",\"provenance\":\"local experiment\",\"source_type\":\"file\"}" \
-  -F 'attachments=@result.txt;type=text/plain' \
-  http://localhost:8080/v1/sources
-```
-
-附件清单含 ID、所属 Source、文件名、MIME、大小和 SHA-256。显式下载：`GET /v1/attachments/{id}?workspace_id=UUID`，同样要求 Bearer Key。响应使用 Content-Disposition attachment 和 SHA-256 ETag。`attachment_read` 对普通文件返回 data.base64 内容（字段名为 `data`），MCP 图片使用 image content。
-
-## 检索
+保存不可变 Source：
 
 ```json
-{
-  "workspace_id": "WORKSPACE_UUID",
-  "query": "实验结果",
-  "mode": "hybrid",
-  "types": ["knowledge"],
-  "tags": ["实验"],
-  "pending_review": true,
-  "limit": 20,
-  "offset": 0
-}
+{"workspace_id":"UUID","type":"source","body":"会话中的原始观察……","provenance":"session-42, messages 10-15","idempotency_key":"session-42:10-15"}
 ```
 
-命中包含 ref（含版本）、snippet、methods、score、pending_review，语义命中带分块 position。只检索当前修订；历史通过 read/history 获取。空关键词可按条件列出对象；显式 semantic 要求非空 query。tags 是 AND，types 是 OR。RRF 使用每种方法前 `max(100,offset+limit+1)` 个候选，最终分页；它不保证并发写入期间跨多个请求的快照一致性。
+可选 source_time（RFC3339）、metadata（JSON 对象）、tags（字符串数组）、attachments。Source 不支持修改，不传 id 或 expected_revision。
+
+新增 Knowledge：
+
+```json
+{"workspace_id":"UUID","type":"knowledge","body":"启用选项 X 后需要重新初始化缓存。","scope":{"product":"example","software":{"version":"2.4","branch":"stable"}},"conditions":"启用 X 后首次启动","tags":["缓存"],"sources":["SOURCE_UUID"],"reason":"Dream 从新日志提取","idempotency_key":"dream-8:fact-1"}
+```
+
+scope 必须是对象，可显式设为 `{}`；至少一个 Source ID，reason 必填。修订时额外传 id 和 expected_revision，仍提交完整正文、scope、conditions、tags、sources 和 reason；省略可选条件/标签表示清空，不合并旧快照。正文、conditions 和 reason 各最长 2000 字符，scope 最长 64 KiB，最多引用 100 个 Source。不同软件版本需要并存时用新 ID，服务不自动合并。
+
+结果 data 是 `{"type":"knowledge","id":"UUID","revision":1}` 或 Source 的 `{type,id}`。revision 是知识修订，软件版本只存在 scope 中。
+
+幂等键长 1..200 字节。同一 Workspace/API Key 下，相同 save 参数可安全重试。发生 revision_conflict 时先读取当前版本，再由客户端判断是否继续修订，不能仅替换 expected_revision 盲目重试。
+
+## search
+
+```json
+{"workspace_id":"UUID","query":"初始化缓存","types":["knowledge"],"scope":{"software":{"version":"2.4"}},"tags":["缓存"],"limit":20,"offset":0}
+```
+
+types 默认 `["knowledge"]`，可含 source；scope 使用 JSONB @> 包含过滤，tags 为 AND。无 scope 过滤时包含全部软件版本；结果按文本相关度排序、ID 打破平局，不按版本或时间推断正确性。Source 没有 scope，非空 scope 过滤会排除 Source。空 query 可用于按过滤条件列举。
+
+命中返回 type、id、revision（Source 为 0）、snippet、scope 和 score。关键词支持中文片段。since（RFC3339）可过滤此时间之后接收的 Source 或产生当前修订的 Knowledge，详见设计中的增量扫描限制。
+
+limit 默认 20、范围 1..100；offset 默认 0、最大 100000。page 包含 limit、offset、has_more。
+
+## read
+
+```json
+{"workspace_id":"UUID","type":"knowledge","id":"UUID","revision":1,"history":true,"limit":20,"offset":0}
+```
+
+revision 省略/0 表示当前知识修订；history=true 返回截至所选修订的历史，按修订倒序排列。Source 读取不传 revision/history。
+
+data.object 是完整 Source 或 Knowledge 快照，Knowledge 包含固定来源 ID 数组。data.sources 是对应修订的来源清单（ID、来源描述、接收时间），附件清单也只来自该修订。sources_page、attachments_page、history_page 分别给出各列表分页；同一 limit/offset 应用于所有列表。要获取证据正文，显式 read 对应 Source ID。
+
+读取附件先 read Source/Knowledge 得到清单，然后：
+
+```json
+{"workspace_id":"UUID","type":"source","id":"SOURCE_UUID","attachment_id":"ATTACHMENT_UUID"}
+```
+
+结果包含附件的 name、mime、size、sha256 和 base64 data；MCP 对 PNG/JPEG/WebP/GIF 返回 image content，text 中保留附件元信息。不能通过另一个 Source ID 读取该附件。
+
+上传在 save Source 中提供 `attachments:[{"name":"log.txt","mime":"text/plain","data":"BASE64"}]`。一次 Source 最多 100 个附件、总大小默认 20 MiB，由 MAX_UPLOAD_BYTES 配置；Source 正文最大 4 MiB。图片等附件需要提供必要的文字描述，服务不执行 OCR。

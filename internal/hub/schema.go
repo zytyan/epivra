@@ -8,24 +8,11 @@ import (
 )
 
 var fields = map[string]string{
-	"source_create":       "body tags conditions metadata provenance source_time source_type attachments",
-	"source_tags_update":  "id expected_version tags reason",
-	"claim_create":        "body tags conditions metadata sources reason",
-	"claim_revise":        "id expected_version body tags conditions metadata sources reason",
-	"verification_create": "body conditions metadata reason claim evidence output_source method performed_at conclusion",
-	"assessment_create":   "body conditions metadata reason claim verifications conclusion valid_from valid_until resolve_events",
-	"knowledge_publish":   "id expected_version body tags conditions metadata reason claims assessments resolve_events",
-	"knowledge_read":      "ref depth limit offset",
-	"knowledge_history":   "ref limit offset",
-	"knowledge_search":    "query mode types tags pending_review limit offset",
-	"attachment_read":     "id",
+	"search": "query types scope tags since limit offset",
+	"read":   "type id revision history attachment_id limit offset",
+	"save":   "type id expected_revision body scope conditions tags sources reason provenance source_time metadata attachments",
 }
-var required = map[string]string{
-	"source_create": "provenance source_type", "source_tags_update": "id expected_version tags reason",
-	"claim_create": "body sources", "claim_revise": "id expected_version body sources reason",
-	"verification_create": "body claim method performed_at conclusion", "assessment_create": "body claim verifications conclusion",
-	"knowledge_publish": "body claims assessments", "knowledge_read": "ref", "knowledge_history": "ref", "attachment_read": "id",
-}
+var required = map[string]string{"read": "type id", "save": "type body"}
 
 func Schema(op string) map[string]any {
 	all := schemaType(reflect.TypeOf(Params{}))["properties"].(map[string]any)
@@ -38,6 +25,13 @@ func Schema(op string) map[string]any {
 	if IsWrite(op) {
 		props["idempotency_key"] = all["idempotency_key"]
 		req = append(req, "idempotency_key")
+	}
+	if property, ok := props["type"].(map[string]any); ok {
+		property["enum"] = []string{"source", "knowledge"}
+	}
+	if property, ok := props["idempotency_key"].(map[string]any); ok {
+		property["minLength"] = 1
+		property["maxLength"] = 200
 	}
 	return map[string]any{"type": "object", "properties": props, "required": req, "additionalProperties": false}
 }

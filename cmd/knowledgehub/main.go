@@ -106,27 +106,6 @@ func run() error {
 		return err
 	}
 	s := &hub.Service{DB: db, MaxUpload: int64(upload)}
-	if os.Getenv("EMBEDDING_BASE_URL") != "" {
-		dim, err := number("EMBEDDING_DIMENSIONS", 1536)
-		if err != nil {
-			return err
-		}
-		batch, err := number("EMBEDDING_BATCH_SIZE", 16)
-		if err != nil {
-			return err
-		}
-		timeout, err := time.ParseDuration(env("EMBEDDING_TIMEOUT", "30s"))
-		if err != nil {
-			return err
-		}
-		s.Embed = &hub.Embedder{BaseURL: os.Getenv("EMBEDDING_BASE_URL"), APIKey: os.Getenv("EMBEDDING_API_KEY"), Model: env("EMBEDDING_MODEL", "text-embedding-3-small"), Dimensions: dim, BatchSize: batch, Timeout: timeout}
-		if err = s.Embed.Validate(); err != nil {
-			return err
-		}
-	}
-	if err = s.ConfigureIndex(ctx); err != nil {
-		return err
-	}
 	mux := http.NewServeMux()
 	httpapi.Register(mux, s)
 	origins := []string{}
@@ -135,12 +114,10 @@ func run() error {
 			origins = append(origins, v)
 		}
 	}
-	if err = mcpserver.Register(mux, s, mcpserver.Config{Path: env("MCP_PATH", "/mcp"), SSEPath: env("MCP_SSE_PATH", "/sse"), MessagesPath: env("MCP_MESSAGES_PATH", "/messages"), BaseURL: os.Getenv("PUBLIC_BASE_URL"), Origins: origins}); err != nil {
+	if err = mcpserver.Register(mux, s, mcpserver.Config{ReadPath: env("MCP_READ_PATH", "/mcp"), WritePath: env("MCP_WRITE_PATH", "/mcp/write"), Origins: origins}); err != nil {
 		return err
 	}
 	srv := &http.Server{Addr: env("LISTEN_ADDR", ":8080"), Handler: httpapi.Limit(s, mux), ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 90 * time.Second, MaxHeaderBytes: 1 << 20}
-	workerDone := make(chan struct{})
-	go func() { defer close(workerDone); s.Worker(ctx) }()
 	go func() {
 		<-ctx.Done()
 		shutdown, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -152,7 +129,6 @@ func run() error {
 	slog.Info("knowledge hub listening", "addr", srv.Addr)
 	err = srv.ListenAndServe()
 	stop()
-	<-workerDone
 	if errors.Is(err, http.ErrServerClosed) {
 		return nil
 	}

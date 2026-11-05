@@ -7,9 +7,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
-	"fmt"
-	"net/http"
-	"net/http/httptest"
 	"net/url"
 	"os"
 	"strings"
@@ -33,7 +30,7 @@ func setup(t *testing.T) *fixture {
 	t.Helper()
 	dsn := os.Getenv("TEST_DATABASE_URL")
 	if dsn == "" {
-		t.Skip("set TEST_DATABASE_URL to run real PostgreSQL/pgvector integration tests")
+		t.Skip("set TEST_DATABASE_URL to run real PostgreSQL integration tests")
 	}
 	admin, err := sql.Open("pgx", dsn)
 	if err != nil {
@@ -95,16 +92,10 @@ func ref(r hub.Result) hub.Ref {
 	return v
 }
 func (f *fixture) source(body string) hub.Ref {
-	return ref(f.call("source_create", hub.Params{Body: body, Provenance: "integration", SourceType: "text", Tags: []string{"中文"}}))
+	return ref(f.call("save", hub.Params{Type: "source", Body: body, Provenance: "test log"}))
 }
-func (f *fixture) loop() (hub.Ref, hub.Ref, hub.Ref, hub.Ref) {
-	src := f.source("中文证据：实验成功")
-	c := ref(f.call("claim_create", hub.Params{Body: "中文主张", Sources: []hub.Ref{src}}))
-	now := time.Now().UTC()
-	v := ref(f.call("verification_create", hub.Params{Body: "observed", Claim: &c, Method: "experiment", PerformedAt: &now, Conclusion: "support", Evidence: []hub.Ref{src}}))
-	a := ref(f.call("assessment_create", hub.Params{Body: "supported within conditions", Claim: &c, Conclusion: "support", Verifications: []hub.Ref{v}}))
-	k := ref(f.call("knowledge_publish", hub.Params{Body: "中文知识", Claims: []hub.Ref{c}, Assessments: []hub.Ref{a}, Tags: []string{"中文"}}))
-	return src, c, a, k
+func (f *fixture) knowledge(src hub.Ref, scope map[string]any) hub.Ref {
+	return ref(f.call("save", hub.Params{Type: "knowledge", Body: "缓存需要显式刷新", Scope: scope, Sources: []string{src.ID}, Reason: "Dream extracted observation"}))
 }
 func code(t *testing.T, err error, want string) {
 	t.Helper()
@@ -113,480 +104,199 @@ func code(t *testing.T, err error, want string) {
 		t.Fatalf("expected %s, got %v", want, err)
 	}
 }
-func TestLifecycleAndDatabaseGuards(t *testing.T) {
-	f := setup(t)
-	src, c, a, k := f.loop()
-	source2 := ref(f.call("source_tags_update", hub.Params{ID: src.ID, ExpectedVersion: 1, Reason: "retag", Tags: []string{"new"}}))
-	if source2.Version != 2 {
-		t.Fatal(source2)
+func object(t *testing.T, out hub.Result) map[string]any {
+	t.Helper()
+	d := out.Data.(hub.ReadData)
+	var o map[string]any
+	if err := json.Unmarshal(d.Object, &o); err != nil {
+		t.Fatal(err)
 	}
-	f.call("claim_revise", hub.Params{ID: c.ID, ExpectedVersion: 1, Body: "changed claim", Reason: "new context", Sources: []hub.Ref{source2}})
-	read := f.call("knowledge_read", hub.Params{Ref: &k, Depth: 5, Limit: 100}).Data.(hub.ReadData)
-	found := false
-	for _, r := range read.Evidence {
-		if r.ID == c.ID {
-			found = true
-			if r.Version != 1 || r.Body != "中文主张" {
-				t.Fatal("historical evidence changed")
-			}
-		}
-	}
-	if !found {
-		t.Fatal("claim missing")
-	}
-	if len(read.ReviewEvents) != 1 {
-		t.Fatalf("missing review event: %v", read.ReviewEvents)
-	}
-	now := time.Now().UTC()
-	v := ref(f.call("verification_create", hub.Params{Body: "contradiction", Claim: &c, Method: "counterexample", PerformedAt: &now, Conclusion: "refute", Evidence: []hub.Ref{src}}))
-	other := ref(f.call("assessment_create", hub.Params{Body: "refuted", Claim: &c, Conclusion: "refute", Verifications: []hub.Ref{v}}))
-	read = f.call("knowledge_read", hub.Params{Ref: &k, Depth: 1, Limit: 100}).Data.(hub.ReadData)
-	if len(read.Assessments) != 2 {
-		t.Fatal("contradicting assessments must coexist")
-	}
-	_, err := f.s.Execute(f.ctx, f.actor, "knowledge_publish", hub.Params{WorkspaceID: f.ws, IdempotencyKey: hub.NewID(), Body: "unsupported", Claims: []hub.Ref{c}, Assessments: []hub.Ref{other}})
-	code(t, err, "invalid_reference")
-	queries := []string{
-		`UPDATE revisions SET body='tampered' WHERE workspace_id=$1 AND object_id=$2`,
-		`DELETE FROM objects WHERE workspace_id=$1 AND id=$2`,
-		`DELETE FROM revisions WHERE workspace_id=$1 AND object_id=$2`,
-		`INSERT INTO attachments(workspace_id,id,source_id,name,mime,size,sha256,content) VALUES($1,gen_random_uuid(),$2,'late','text/plain',1,'x','x')`,
-	}
-	for _, q := range queries {
-		if _, err = f.s.DB.Exec(q, f.ws, src.ID); err == nil {
-			t.Fatal("database allowed immutable mutation", q)
-		}
-	}
-	tx, _ := f.s.DB.Begin()
-	_, err = tx.Exec(`INSERT INTO revisions(workspace_id,object_id,version,kind,body,tags,author,provenance,source_type) VALUES($1,$2,3,'source','changed','{}',$3,'integration','text')`, f.ws, src.ID, f.actor)
-	tx.Rollback()
-	if err == nil {
-		t.Fatal("database allowed source content revision")
-	}
-	// A foreign workspace can never be linked, even if the actor has access to both.
-	ws2 := hub.NewID()
-	f.s.DB.Exec(`INSERT INTO workspaces(id,name) VALUES($1,'second')`, ws2)
-	f.s.DB.Exec(`INSERT INTO key_permissions(key_id,workspace_id,can_write) VALUES($1,$2,true)`, f.actor, ws2)
-	_, err = f.s.Execute(f.ctx, f.actor, "claim_create", hub.Params{WorkspaceID: ws2, IdempotencyKey: hub.NewID(), Body: "cross workspace", Sources: []hub.Ref{src}})
-	code(t, err, "not_found")
-	_ = a
+	return o
 }
-func TestIdempotencyAndConcurrentVersions(t *testing.T) {
+func TestAtomicKnowledgeScopesAndHistory(t *testing.T) {
 	f := setup(t)
-	p := hub.Params{WorkspaceID: f.ws, IdempotencyKey: "same", Body: "repeated", Provenance: "test", SourceType: "text"}
+	s1 := f.source("v1 source")
+	s2 := f.source("v2 source")
+	oldScope := map[string]any{"software": map[string]any{"version": "1.0", "branch": "stable"}, "hardware": "arm64"}
+	newScope := map[string]any{"software": map[string]any{"version": "2.0", "branch": "main"}, "hardware": "arm64"}
+	k1 := f.knowledge(s1, oldScope)
+	k2 := f.knowledge(s2, newScope)
+	updated := ref(f.call("save", hub.Params{Type: "knowledge", ID: k1.ID, ExpectedRevision: 1, Body: "旧软件也可以补充知识", Scope: oldScope, Sources: []string{s1.ID, s2.ID}, Reason: "Dream incorporated another source"}))
+	if updated.Revision != 2 {
+		t.Fatal(updated)
+	}
+	old := object(t, f.call("read", hub.Params{Type: "knowledge", ID: k1.ID, Revision: 1}))
+	if old["body"] != "缓存需要显式刷新" || len(old["sources"].([]any)) != 1 {
+		t.Fatal("historical snapshot changed", old)
+	}
+	current := f.call("read", hub.Params{Type: "knowledge", ID: k1.ID, History: true, Limit: 1})
+	if len(current.Data.(hub.ReadData).History) != 1 || !current.Data.(hub.ReadData).HistoryPage.HasMore {
+		t.Fatal("history pagination")
+	}
+	if object(t, f.call("read", hub.Params{Type: "knowledge", ID: k2.ID}))["revision"] != float64(1) {
+		t.Fatal("newer software knowledge overwritten")
+	}
+	// A new independent fact about old software receives a fresh Knowledge ID.
+	extra := f.knowledge(s1, oldScope)
+	if extra.ID == k1.ID {
+		t.Fatal("implicit scope merge")
+	}
+	result := f.call("search", hub.Params{Scope: map[string]any{"software": map[string]any{"version": "1.0"}}, Limit: 100})
+	hits := result.Data.([]json.RawMessage)
+	if len(hits) != 2 {
+		t.Fatalf("JSONB scope filter: %s", hits)
+	}
+	result = f.call("search", hub.Params{Query: "要显式", Scope: newScope})
+	if len(result.Data.([]json.RawMessage)) != 1 {
+		t.Fatal("Chinese keyword and scope filter")
+	}
+	result = f.call("search", hub.Params{Scope: map[string]any{"software": map[string]any{"version": "3.0"}}})
+	if len(result.Data.([]json.RawMessage)) != 0 {
+		t.Fatal("version comparisons inferred")
+	}
+	result = f.call("search", hub.Params{Since: ptrTime(time.Now().Add(time.Hour)), Types: []string{"source"}})
+	if len(result.Data.([]json.RawMessage)) != 0 {
+		t.Fatal("incremental source filter")
+	}
+}
+func ptrTime(t time.Time) *time.Time { return &t }
+func TestIdempotencyCASAndIsolation(t *testing.T) {
+	f := setup(t)
+	p := hub.Params{WorkspaceID: f.ws, Type: "source", Body: "same history", Provenance: "log", IdempotencyKey: "same"}
 	var wg sync.WaitGroup
-	ids := make(chan hub.Ref, 12)
+	results := make(chan hub.Ref, 12)
 	errs := make(chan error, 12)
 	for i := 0; i < 12; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			r, err := f.s.Execute(f.ctx, f.actor, "source_create", p)
+			r, err := f.s.Execute(f.ctx, f.actor, "save", p)
 			if err != nil {
 				errs <- err
 			} else {
-				ids <- ref(r)
+				results <- ref(r)
 			}
 		}()
 	}
 	wg.Wait()
-	close(ids)
+	close(results)
 	close(errs)
 	for err := range errs {
 		t.Fatal(err)
 	}
-	var id string
-	for r := range ids {
-		if id != "" && id != r.ID {
-			t.Fatal("duplicate creation")
+	var source hub.Ref
+	for r := range results {
+		if source.ID != "" && source.ID != r.ID {
+			t.Fatal("duplicated source")
 		}
-		id = r.ID
+		source = r
 	}
 	p.Body = "different"
-	_, err := f.s.Execute(f.ctx, f.actor, "source_create", p)
+	_, err := f.s.Execute(f.ctx, f.actor, "save", p)
 	code(t, err, "idempotency_conflict")
-	versions := make(chan error, 2)
+	k := f.knowledge(source, map[string]any{"version": "1"})
+	errs = make(chan error, 2)
 	for i := 0; i < 2; i++ {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
-			_, e := f.s.Execute(f.ctx, f.actor, "source_tags_update", hub.Params{WorkspaceID: f.ws, IdempotencyKey: fmt.Sprint(i), ID: id, ExpectedVersion: 1, Reason: "race", Tags: []string{fmt.Sprint(i)}})
-			versions <- e
-		}(i)
-	}
-	wg.Wait()
-	close(versions)
-	success, conflict := 0, 0
-	for e := range versions {
-		if e == nil {
-			success++
-		} else {
-			code(t, e, "version_conflict")
-			conflict++
-		}
-	}
-	if success != 1 || conflict != 1 {
-		t.Fatal("lost update", success, conflict)
-	}
-}
-func TestReviewAcknowledgesOnlyExplicitEvents(t *testing.T) {
-	f := setup(t)
-	src, c, a, k := f.loop()
-	now := time.Now().UTC()
-	verify := func() hub.Ref {
-		return ref(f.call("verification_create", hub.Params{Body: "new evidence", Claim: &c, Method: "test", PerformedAt: &now, Conclusion: "uncertain", Evidence: []hub.Ref{src}}))
-	}
-	verify()
-	d := f.call("knowledge_read", hub.Params{Ref: &k}).Data.(hub.ReadData)
-	var event struct {
-		ID string `json:"id"`
-	}
-	json.Unmarshal(d.ReviewEvents[0], &event)
-	// Concurrent evidence may arrive after the agent read the review queue.
-	var wg sync.WaitGroup
-	errs := make(chan error, 2)
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		_, e := f.s.Execute(f.ctx, f.actor, "verification_create", hub.Params{WorkspaceID: f.ws, IdempotencyKey: hub.NewID(), Body: "arrived during review", Claim: &c, Method: "test", PerformedAt: &now, Conclusion: "refute", Evidence: []hub.Ref{src}})
-		errs <- e
-	}()
-	go func() {
-		defer wg.Done()
-		_, e := f.s.Execute(f.ctx, f.actor, "knowledge_publish", hub.Params{WorkspaceID: f.ws, IdempotencyKey: hub.NewID(), ID: k.ID, ExpectedVersion: 1, Reason: "review", Body: "reviewed knowledge", Claims: []hub.Ref{c}, Assessments: []hub.Ref{a}, ResolveEvents: []string{event.ID}})
-		errs <- e
-	}()
-	wg.Wait()
-	close(errs)
-	for e := range errs {
-		if e != nil {
-			t.Fatal(e)
-		}
-	}
-	current := k
-	current.Version = 0
-	d = f.call("knowledge_read", hub.Params{Ref: &current}).Data.(hub.ReadData)
-	if len(d.ReviewEvents) != 1 {
-		t.Fatalf("concurrent event lost: %s", mustJSON(d.ReviewEvents))
-	}
-	pending := true
-	hits := f.call("knowledge_search", hub.Params{Mode: "keyword", PendingReview: &pending, Types: []string{"knowledge"}}).Data.([]hub.Hit)
-	if len(hits) != 1 {
-		t.Fatal("review filter")
-	}
-}
-func mustJSON(v any) string { b, _ := json.Marshal(v); return string(b) }
-func TestSearchIndexAndLeaseRecovery(t *testing.T) {
-	f := setup(t)
-	requireVector(t, f)
-	src, _, _, k := f.loop()
-	hits := f.call("knowledge_search", hub.Params{Mode: "keyword", Query: "文知", Tags: []string{"中文"}}).Data.([]hub.Hit)
-	if len(hits) != 1 || hits[0].Ref != k {
-		t.Fatalf("Chinese substring or tag filter failed: %+v", hits)
-	}
-	fallback := f.call("knowledge_search", hub.Params{Mode: "hybrid", Query: "中文"})
-	if len(fallback.Warnings) == 0 {
-		t.Fatal("missing fallback warning")
-	}
-	_, err := f.s.Execute(f.ctx, f.actor, "knowledge_search", hub.Params{WorkspaceID: f.ws, Mode: "semantic", Query: "中文"})
-	code(t, err, "semantic_unavailable")
-	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var q struct {
-			Input      []string `json:"input"`
-			Dimensions int      `json:"dimensions"`
-		}
-		json.NewDecoder(r.Body).Decode(&q)
-		data := []any{}
-		for i := range q.Input {
-			v := make([]float64, q.Dimensions)
-			v[0] = 1
-			data = append(data, map[string]any{"index": i, "embedding": v})
-		}
-		json.NewEncoder(w).Encode(map[string]any{"data": data})
-	}))
-	defer api.Close()
-	f.s.Embed = &hub.Embedder{BaseURL: api.URL, Model: "test", Dimensions: 3, BatchSize: 2, Timeout: time.Second}
-	if err = f.s.ConfigureIndex(f.ctx); err != nil {
-		t.Fatal(err)
-	}
-	lag := f.call("knowledge_search", hub.Params{Mode: "semantic", Query: "中文"})
-	if len(lag.Warnings) == 0 {
-		t.Fatal("missing lag warning")
-	}
-	jobs := make(chan hub.Job, 20)
-	var wg sync.WaitGroup
-	for i := 0; i < 10; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			j, e := f.s.ClaimJob(f.ctx)
-			if e == nil {
-				jobs <- j
-			} else if !errors.Is(e, sql.ErrNoRows) {
-				t.Error(e)
-			}
+			_, e := f.s.Execute(f.ctx, f.actor, "save", hub.Params{WorkspaceID: f.ws, Type: "knowledge", ID: k.ID, ExpectedRevision: 1, Body: "revised", Scope: map[string]any{"version": "1"}, Sources: []string{source.ID}, Reason: "reviewed", IdempotencyKey: hub.NewID()})
+			errs <- e
 		}()
 	}
 	wg.Wait()
-	close(jobs)
-	seen := map[int64]bool{}
-	var first hub.Job
-	for j := range jobs {
-		if seen[j.ID] {
-			t.Fatal("duplicate lease")
-		}
-		seen[j.ID] = true
-		if first.ID == 0 {
-			first = j
-		} else if err = f.s.RunJob(f.ctx, j); err != nil {
-			t.Fatal(err)
+	close(errs)
+	success := 0
+	for e := range errs {
+		if e == nil {
+			success++
+		} else {
+			code(t, e, "revision_conflict")
 		}
 	}
-	if first.ID == 0 {
-		t.Fatal("no indexing jobs")
+	if success != 1 {
+		t.Fatal("lost update")
 	}
-	f.s.DB.Exec(`UPDATE index_jobs SET lease_until=now()-interval '1 second' WHERE id=$1`, first.ID)
-	recovered, e := f.s.ClaimJob(f.ctx)
-	if e != nil {
-		t.Fatal(e)
-	}
-	if recovered.ID != first.ID || recovered.Token == first.Token {
-		t.Fatal("lease not recovered")
-	}
-	if err = f.s.RunJob(f.ctx, first); err == nil {
-		t.Fatal("stale owner committed")
-	}
-	if err = f.s.RunJob(f.ctx, recovered); err != nil {
+	ws2 := hub.NewID()
+	if _, err = f.s.DB.Exec(`INSERT INTO workspaces(id,name) VALUES($1,'other')`, ws2); err != nil {
 		t.Fatal(err)
 	}
-	semantic := f.call("knowledge_search", hub.Params{Mode: "semantic", Query: "中文"})
-	if len(semantic.Data.([]hub.Hit)) == 0 || len(semantic.Warnings) != 0 {
-		t.Fatal("index incomplete", semantic)
-	}
-	// An old revision task cannot make new revision appear indexed.
-	f.call("source_tags_update", hub.Params{ID: src.ID, ExpectedVersion: 1, Reason: "tags", Tags: []string{"changed"}})
-	old, e := f.s.ClaimJob(f.ctx)
-	if e != nil {
-		t.Fatal(e)
-	}
-	f.call("source_tags_update", hub.Params{ID: src.ID, ExpectedVersion: 2, Reason: "tags again", Tags: []string{"latest"}})
-	if err = f.s.RunJob(f.ctx, old); err != nil {
+	f.s.DB.Exec(`INSERT INTO key_permissions VALUES($1,$2,true)`, f.actor, ws2)
+	_, err = f.s.Execute(f.ctx, f.actor, "save", hub.Params{WorkspaceID: ws2, Type: "knowledge", Body: "cross workspace", Scope: map[string]any{}, Sources: []string{source.ID}, Reason: "bad", IdempotencyKey: hub.NewID()})
+	code(t, err, "invalid_reference")
+	out, err := f.s.Execute(f.ctx, f.actor, "search", hub.Params{WorkspaceID: ws2})
+	if err != nil {
 		t.Fatal(err)
 	}
-	lag = f.call("knowledge_search", hub.Params{Mode: "semantic", Query: "中文"})
-	if len(lag.Warnings) == 0 {
-		t.Fatal("old job masked new revision lag")
+	if len(out.Data.([]json.RawMessage)) != 0 {
+		t.Fatal("workspace search leak")
 	}
-	oldFP := f.s.Embed.Fingerprint()
-	f.s.Embed.Model = "new-model"
-	f.s.Embed.Dimensions = 4
-	if err = f.s.ConfigureIndex(f.ctx); err != nil {
-		t.Fatal(err)
-	}
-	if oldFP == f.s.Embed.Fingerprint() {
-		t.Fatal("model fingerprint unchanged")
-	}
-	changed := f.call("knowledge_search", hub.Params{Mode: "semantic", Query: "中文"})
-	if len(changed.Data.([]hub.Hit)) != 0 || len(changed.Warnings) == 0 {
-		t.Fatal("model vectors mixed")
-	}
-	api.Close()
-	failed := f.call("knowledge_search", hub.Params{Mode: "hybrid", Query: "中文"})
-	if len(failed.Data.([]hub.Hit)) == 0 || len(failed.Warnings) == 0 {
-		t.Fatal("API failure did not degrade")
-	}
+	_, err = f.s.Execute(f.ctx, f.actor, "read", hub.Params{WorkspaceID: ws2, Type: "source", ID: source.ID})
+	code(t, err, "not_found")
 }
-func TestAttachmentAndReadOnlyKey(t *testing.T) {
+func TestImmutableEvidenceAndAttachments(t *testing.T) {
 	f := setup(t)
-	src := ref(f.call("source_create", hub.Params{Provenance: "test", SourceType: "binary", Attachments: []hub.AttachmentInput{{Name: "x.bin", MIME: "application/octet-stream", Data: base64.StdEncoding.EncodeToString([]byte{0, 1, 255})}}}))
-	d := f.call("knowledge_read", hub.Params{Ref: &src}).Data.(hub.ReadData)
+	source := ref(f.call("save", hub.Params{Type: "source", Body: "binary description", Provenance: "file", Attachments: []hub.AttachmentInput{{Name: "x.bin", MIME: "application/octet-stream", Data: base64.StdEncoding.EncodeToString([]byte{0, 1, 255})}}}))
+	k := f.knowledge(source, map[string]any{})
+	d := f.call("read", hub.Params{Type: "knowledge", ID: k.ID}).Data.(hub.ReadData)
 	if len(d.Attachments) != 1 || d.Attachments[0].Data != "" {
-		t.Fatal("attachment manifest invalid")
+		t.Fatal("bad attachment manifest")
 	}
-	a := f.call("attachment_read", hub.Params{ID: d.Attachments[0].ID}).Data.(hub.Attachment)
+	a := f.call("read", hub.Params{Type: "source", ID: source.ID, AttachmentID: d.Attachments[0].ID}).Data.(hub.Attachment)
 	if a.Data != "AAH/" || a.Size != 3 {
-		t.Fatal(a)
+		t.Fatal("binary changed")
+	}
+	other := f.source("different")
+	_, err := f.s.Execute(f.ctx, f.actor, "read", hub.Params{WorkspaceID: f.ws, Type: "source", ID: other.ID, AttachmentID: a.ID})
+	code(t, err, "not_found")
+	checks := []string{`UPDATE sources SET body='changed' WHERE workspace_id=$1 AND id=$2`, `DELETE FROM sources WHERE workspace_id=$1 AND id=$2`, `INSERT INTO attachments(workspace_id,id,source_id,name,mime,size,sha256,content) VALUES($1,gen_random_uuid(),$2,'late','text/plain',1,'x','x')`}
+	for _, q := range checks {
+		if _, err = f.s.DB.Exec(q, f.ws, source.ID); err == nil {
+			t.Fatal("source mutation allowed", q)
+		}
+	}
+	for _, q := range []string{`UPDATE knowledge_revisions SET reason='changed' WHERE workspace_id=$1 AND knowledge_id=$2`, `DELETE FROM knowledge_sources WHERE workspace_id=$1 AND knowledge_id=$2`, `INSERT INTO knowledge_sources VALUES($1,$2,1,$3)`} {
+		args := []any{f.ws, k.ID}
+		if strings.HasPrefix(q, "INSERT") {
+			args = append(args, other.ID)
+		}
+		if _, err = f.s.DB.Exec(q, args...); err == nil {
+			t.Fatal("historical evidence mutable", q)
+		}
 	}
 	f.s.DB.Exec(`UPDATE key_permissions SET can_write=false WHERE key_id=$1`, f.actor)
-	_, err := f.s.Execute(f.ctx, f.actor, "source_create", hub.Params{WorkspaceID: f.ws, IdempotencyKey: "denied"})
+	_, err = f.s.Execute(f.ctx, f.actor, "save", hub.Params{WorkspaceID: f.ws, IdempotencyKey: "denied", Type: "source", Body: "x", Provenance: "x"})
 	code(t, err, "forbidden")
-	f.call("knowledge_read", hub.Params{Ref: &src})
+	f.call("read", hub.Params{Type: "source", ID: source.ID})
 	f.s.DB.Exec(`UPDATE api_keys SET revoked_at=now() WHERE id=$1`, f.actor)
 	_, err = f.s.Authenticate(f.ctx, f.key)
 	code(t, err, "unauthorized")
 }
-
-func TestOutstandingEventsBeforePublicationAndRemovedClaims(t *testing.T) {
+func TestKnowledgeValidationAndRollback(t *testing.T) {
 	f := setup(t)
-	src, c, a, k := f.loop()
-	now := time.Now().UTC()
-	f.call("verification_create", hub.Params{Body: "new issue", Claim: &c, Method: "test", PerformedAt: &now, Conclusion: "refute", Evidence: []hub.Ref{src}})
-	// Newly published knowledge must see relevant events that predate publication.
-	newer := ref(f.call("knowledge_publish", hub.Params{Body: "new publication", Claims: []hub.Ref{c}, Assessments: []hub.Ref{a}}))
-	d := f.call("knowledge_read", hub.Params{Ref: &newer}).Data.(hub.ReadData)
-	if len(d.ReviewEvents) != 1 {
-		t.Fatal("pre-publication evidence lost")
-	}
-	var ev struct {
-		ID string `json:"id"`
-	}
-	json.Unmarshal(d.ReviewEvents[0], &ev)
-	_, otherClaim, otherAssessment, _ := f.loop()
-	// Explicitly removing a previously depended-on claim can acknowledge its event.
-	f.call("knowledge_publish", hub.Params{ID: k.ID, ExpectedVersion: 1, Reason: "remove old claim", Body: "uses another claim", Claims: []hub.Ref{otherClaim}, Assessments: []hub.Ref{otherAssessment}, ResolveEvents: []string{ev.ID}})
-	k.Version = 0
-	after := f.call("knowledge_read", hub.Params{Ref: &k}).Data.(hub.ReadData)
-	if len(after.ReviewEvents) != 0 {
-		t.Fatal("removed claim event cannot be acknowledged")
-	}
-	ws2 := hub.NewID()
-	f.s.DB.Exec(`INSERT INTO workspaces(id,name) VALUES($1,'empty')`, ws2)
-	f.s.DB.Exec(`INSERT INTO key_permissions(key_id,workspace_id,can_write) VALUES($1,$2,true)`, f.actor, ws2)
-	isolated, err := f.s.Execute(f.ctx, f.actor, "knowledge_search", hub.Params{WorkspaceID: ws2, Mode: "keyword", Query: "中文"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(isolated.Data.([]hub.Hit)) != 0 {
-		t.Fatal("cross workspace search leak")
-	}
-}
-
-func TestInlineEvidenceAndRetryExhaustion(t *testing.T) {
-	f := setup(t)
-	requireVector(t, f)
 	source := f.source("seed")
-	claim := ref(f.call("claim_create", hub.Params{Body: "test claim", Sources: []hub.Ref{source}}))
-	now := time.Now().UTC()
-	verification := ref(f.call("verification_create", hub.Params{Body: "inline output", Claim: &claim, Method: "test", PerformedAt: &now, Conclusion: "support", OutputSource: &hub.SourceInput{Body: "output source", Provenance: "tool", SourceType: "result"}}))
-	d := f.call("knowledge_read", hub.Params{Ref: &verification, Depth: 2, Limit: 100}).Data.(hub.ReadData)
-	found := false
-	for _, r := range d.Evidence {
-		if r.Kind == "source" && r.Body == "output source" {
-			found = true
+	cases := []hub.Params{
+		{Type: "knowledge", Body: strings.Repeat("中", 2001), Scope: map[string]any{}, Sources: []string{source.ID}, Reason: "too long"},
+		{Type: "knowledge", Body: "no scope", Sources: []string{source.ID}, Reason: "x"},
+		{Type: "knowledge", Body: "no source", Scope: map[string]any{}, Reason: "x"},
+		{Type: "knowledge", Body: "no reason", Scope: map[string]any{}, Sources: []string{source.ID}},
+		{Type: "source", ID: source.ID, Body: "overwrite", Provenance: "x"},
+	}
+	for _, p := range cases {
+		p.WorkspaceID = f.ws
+		p.IdempotencyKey = hub.NewID()
+		_, err := f.s.Execute(f.ctx, f.actor, "save", p)
+		code(t, err, "invalid_input")
+	}
+	var count int
+	if err := f.s.DB.QueryRow(`SELECT count(*) FROM knowledge`).Scan(&count); err != nil || count != 0 {
+		t.Fatal("partial writes", count, err)
+	}
+	// New schema has no workflow, indexing, migration or vector objects.
+	for _, table := range []string{"claims", "verifications", "assessments", "review_events", "index_jobs", "chunks", "schema_migrations"} {
+		var name sql.NullString
+		if err := f.s.DB.QueryRow(`SELECT to_regclass(format('%I.%I',current_schema(),$1::text))::text`, table).Scan(&name); err != nil || name.Valid {
+			t.Fatal("legacy table exists", table, err)
 		}
 	}
-	if !found {
-		t.Fatal("inline output source missing")
-	}
-	badAPI := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(503) }))
-	defer badAPI.Close()
-	f.s.Embed = &hub.Embedder{BaseURL: badAPI.URL, Model: "test", Dimensions: 3, BatchSize: 2, Timeout: time.Second}
-	if err := f.s.ConfigureIndex(f.ctx); err != nil {
-		t.Fatal(err)
-	}
-	var target int64
-	for i := 0; i < 5; i++ {
-		j, err := f.s.ClaimJob(f.ctx)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if target == 0 {
-			target = j.ID
-		}
-		if j.ID != target {
-			t.Fatal("unexpected retry job")
-		}
-		if err = f.s.RunJob(f.ctx, j); err == nil {
-			t.Fatal("503 should fail job")
-		}
-		if _, err = f.s.DB.Exec(`UPDATE index_jobs SET available_at=now() WHERE id=$1`, j.ID); err != nil {
-			t.Fatal(err)
-		}
-	}
-	var state string
-	var attempts int
-	if err := f.s.DB.QueryRow(`SELECT state,attempts FROM index_jobs WHERE id=$1`, target).Scan(&state, &attempts); err != nil {
-		t.Fatal(err)
-	}
-	if state != "failed" || attempts != 5 {
-		t.Fatal("unbounded retry", state, attempts)
-	}
-}
-
-func requireVector(t *testing.T, f *fixture) {
-	t.Helper()
-	var enabled bool
-	if err := f.s.DB.QueryRow(`SELECT EXISTS(SELECT 1 FROM pg_extension WHERE extname='vector')`).Scan(&enabled); err != nil {
-		t.Fatal(err)
-	}
-	if !enabled {
-		t.Skip("semantic indexing test requires pgvector enabled in TEST_DATABASE_URL")
-	}
-}
-
-func TestWithoutVector(t *testing.T) {
-	dsn := os.Getenv("TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("TEST_DATABASE_URL required")
-	}
-	admin, err := sql.Open("pgx", dsn)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { admin.Close() })
-	// A separate database guarantees the extension is absent without dropping it
-	// from the caller's database or from another concurrently running test.
-	name := "optional_" + strings.ReplaceAll(hub.NewID(), "-", "")
-	if _, err = admin.Exec(`CREATE DATABASE ` + name + ` TEMPLATE template0 ENCODING 'UTF8'`); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		if _, err := admin.Exec(`DROP DATABASE ` + name); err != nil {
-			t.Error(err)
-		}
-	})
-	u, err := url.Parse(dsn)
-	if err != nil {
-		t.Fatal(err)
-	}
-	u.Path = "/" + name
-	t.Setenv("TEST_DATABASE_URL", u.String())
-	f := setup(t)
-	_, _, _, k := f.loop()
-	var chunks sql.NullString
-	if err = f.s.DB.QueryRow(`SELECT to_regclass('chunks')::text`).Scan(&chunks); err != nil {
-		t.Fatal(err)
-	}
-	if chunks.Valid {
-		t.Fatal("vector table created without extension")
-	}
-	calls := 0
-	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls++
-		var q struct {
-			Input []string `json:"input"`
-		}
-		json.NewDecoder(r.Body).Decode(&q)
-		data := []any{}
-		for i := range q.Input {
-			data = append(data, map[string]any{"index": i, "embedding": []float64{1, 1, 1}})
-		}
-		json.NewEncoder(w).Encode(map[string]any{"data": data})
-	}))
-	defer api.Close()
-	f.s.Embed = &hub.Embedder{BaseURL: api.URL, Model: "optional", Dimensions: 3, BatchSize: 16, Timeout: time.Second}
-	if err = f.s.ConfigureIndex(f.ctx); err != nil {
-		t.Fatal("missing plugin prevented startup", err)
-	}
-	keyword := f.call("knowledge_search", hub.Params{Mode: "keyword", Query: "中文知识"})
-	if len(keyword.Data.([]hub.Hit)) != 1 {
-		t.Fatal("keyword unavailable")
-	}
-	hybrid := f.call("knowledge_search", hub.Params{Mode: "hybrid", Query: "中文知识"})
-	if len(hybrid.Data.([]hub.Hit)) != 1 || len(hybrid.Warnings) == 0 || !strings.Contains(hybrid.Warnings[0], "pgvector") {
-		t.Fatal("missing explicit fallback", hybrid)
-	}
-	_, err = f.s.Execute(f.ctx, f.actor, "knowledge_search", hub.Params{WorkspaceID: f.ws, Mode: "semantic", Query: "中文知识"})
-	code(t, err, "semantic_unavailable")
-	if calls != 0 {
-		t.Fatal("embedding API called without pgvector")
-	}
-	if _, err = f.s.ClaimJob(f.ctx); !errors.Is(err, sql.ErrNoRows) {
-		t.Fatal("index work claimed without plugin", err)
-	}
-	var jobs int
-	if err = f.s.DB.QueryRow(`SELECT count(*) FROM index_jobs`).Scan(&jobs); err != nil || jobs != 0 {
-		t.Fatal("jobs enqueued without plugin", jobs, err)
-	}
-	f.call("knowledge_read", hub.Params{Ref: &k, Depth: 5})
 }
