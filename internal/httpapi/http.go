@@ -7,15 +7,11 @@ import (
 	"io"
 	"mime"
 	"net/http"
-	"strings"
 	"time"
 
 	"epivra/internal/hub"
 )
 
-type actorKey struct{}
-
-func Actor(ctx context.Context) string { v, _ := ctx.Value(actorKey{}).(string); return v }
 func Error(w http.ResponseWriter, err error) {
 	var e *hub.Error
 	if !errors.As(err, &e) {
@@ -23,9 +19,6 @@ func Error(w http.ResponseWriter, err error) {
 	}
 	status := http.StatusBadRequest
 	switch e.Code {
-	case "unauthorized":
-		status = 401
-		w.Header().Set("WWW-Authenticate", "Bearer")
 	case "forbidden":
 		status = 403
 	case "not_found":
@@ -45,21 +38,6 @@ func JSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
-}
-func Authenticate(s *hub.Service, next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		parts := strings.Fields(r.Header.Get("Authorization"))
-		if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") {
-			Error(w, &hub.Error{Code: "unauthorized", Message: "Bearer API key required"})
-			return
-		}
-		actor, err := s.Authenticate(r.Context(), parts[1])
-		if err != nil {
-			Error(w, err)
-			return
-		}
-		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), actorKey{}, actor)))
-	})
 }
 func Limit(s *hub.Service, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -102,7 +80,7 @@ func Register(mux *http.ServeMux, s *hub.Service) {
 
 	for _, operation := range hub.Operations {
 		op := operation
-		mux.Handle("POST /v1/"+op, Authenticate(s, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { call(w, r, s, op) })))
+		mux.Handle("POST /v1/"+op, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { call(w, r, s, op) }))
 	}
 }
 func call(w http.ResponseWriter, r *http.Request, s *hub.Service, op string) {
@@ -126,7 +104,7 @@ func call(w http.ResponseWriter, r *http.Request, s *hub.Service, op string) {
 		Error(w, err)
 		return
 	}
-	out, err := s.Execute(r.Context(), Actor(r.Context()), op, p)
+	out, err := s.Execute(r.Context(), op, p)
 	if err != nil {
 		Error(w, err)
 		return

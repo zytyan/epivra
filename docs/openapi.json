@@ -1,14 +1,6 @@
 {
-  "components": {
-    "securitySchemes": {
-      "bearerAuth": {
-        "scheme": "bearer",
-        "type": "http"
-      }
-    }
-  },
   "info": {
-    "description": "Source and atomic Knowledge. Knowledge revisions and software versions in JSONB scope are independent. Save requires idempotency_key; Knowledge requires scope, sources, reason, and expected_revision when id is supplied.",
+    "description": "Source and atomic Knowledge in a shared default workspace. No authentication or workspace selection. Knowledge revisions and software versions in JSONB scope are independent. Save requires idempotency_key; Knowledge requires scope, sources, reason, and expected_revision when id is supplied.",
     "title": "Epivra",
     "version": "0.2.0"
   },
@@ -73,13 +65,9 @@
                       "knowledge"
                     ],
                     "type": "string"
-                  },
-                  "workspace_id": {
-                    "type": "string"
                   }
                 },
                 "required": [
-                  "workspace_id",
                   "type",
                   "id"
                 ],
@@ -94,12 +82,6 @@
             "description": "200: data, warnings and optional page; errors: error.code, error.message and optional error.details"
           },
           "400": {
-            "description": "200: data, warnings and optional page; errors: error.code, error.message and optional error.details"
-          },
-          "401": {
-            "description": "200: data, warnings and optional page; errors: error.code, error.message and optional error.details"
-          },
-          "403": {
             "description": "200: data, warnings and optional page; errors: error.code, error.message and optional error.details"
           },
           "404": {
@@ -202,13 +184,9 @@
                       "knowledge"
                     ],
                     "type": "string"
-                  },
-                  "workspace_id": {
-                    "type": "string"
                   }
                 },
                 "required": [
-                  "workspace_id",
                   "type",
                   "body",
                   "idempotency_key"
@@ -224,12 +202,6 @@
             "description": "200: data, warnings and optional page; errors: error.code, error.message and optional error.details"
           },
           "400": {
-            "description": "200: data, warnings and optional page; errors: error.code, error.message and optional error.details"
-          },
-          "401": {
-            "description": "200: data, warnings and optional page; errors: error.code, error.message and optional error.details"
-          },
-          "403": {
             "description": "200: data, warnings and optional page; errors: error.code, error.message and optional error.details"
           },
           "404": {
@@ -284,14 +256,9 @@
                       "type": "string"
                     },
                     "type": "array"
-                  },
-                  "workspace_id": {
-                    "type": "string"
                   }
                 },
-                "required": [
-                  "workspace_id"
-                ],
+                "required": [],
                 "type": "object"
               }
             }
@@ -303,12 +270,6 @@
             "description": "200: data, warnings and optional page; errors: error.code, error.message and optional error.details"
           },
           "400": {
-            "description": "200: data, warnings and optional page; errors: error.code, error.message and optional error.details"
-          },
-          "401": {
-            "description": "200: data, warnings and optional page; errors: error.code, error.message and optional error.details"
-          },
-          "403": {
             "description": "200: data, warnings and optional page; errors: error.code, error.message and optional error.details"
           },
           "404": {
@@ -327,9 +288,5 @@
       }
     }
   },
-  "security": [
-    {
-      "bearerAuth": []
-    }
-  ]
+  "security": []
 }

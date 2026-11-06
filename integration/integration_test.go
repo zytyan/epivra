@@ -2,7 +2,6 @@ package integration
 
 import (
 	"context"
-	"crypto/sha256"
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
@@ -20,10 +19,10 @@ import (
 )
 
 type fixture struct {
-	t              *testing.T
-	s              *hub.Service
-	actor, ws, key string
-	ctx            context.Context
+	t   *testing.T
+	s   *hub.Service
+	ws  string
+	ctx context.Context
 }
 
 func setup(t *testing.T) *fixture {
@@ -60,26 +59,19 @@ func setup(t *testing.T) *fixture {
 	if err = schema.Initialize(ctx, db); err != nil {
 		t.Fatal("initialization not idempotent", err)
 	}
-	f := &fixture{t: t, s: &hub.Service{DB: db}, actor: hub.NewID(), ws: hub.NewID(), key: "test_" + hub.NewID(), ctx: ctx}
-	hash := sha256.Sum256([]byte(f.key))
-	if _, err = db.Exec(`INSERT INTO workspaces(id,name) VALUES($1,'test')`, f.ws); err != nil {
+	f := &fixture{t: t, s: &hub.Service{DB: db}, ctx: ctx}
+	if err = db.QueryRow(`SELECT id FROM workspaces WHERE name='default'`).Scan(&f.ws); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = db.Exec(`INSERT INTO api_keys(id,name,digest) VALUES($1,'agent',$2)`, f.actor, hash[:]); err != nil {
-		t.Fatal(err)
-	}
-	if _, err = db.Exec(`INSERT INTO key_permissions(key_id,workspace_id,can_write) VALUES($1,$2,true)`, f.actor, f.ws); err != nil {
-		t.Fatal(err)
-	}
+
 	return f
 }
 func (f *fixture) call(op string, p hub.Params) hub.Result {
 	f.t.Helper()
-	p.WorkspaceID = f.ws
 	if hub.IsWrite(op) && p.IdempotencyKey == "" {
 		p.IdempotencyKey = hub.NewID()
 	}
-	r, err := f.s.Execute(f.ctx, f.actor, op, p)
+	r, err := f.s.Execute(f.ctx, op, p)
 	if err != nil {
 		f.t.Fatalf("%s: %v", op, err)
 	}
@@ -160,9 +152,9 @@ func TestAtomicKnowledgeScopesAndHistory(t *testing.T) {
 	}
 }
 func ptrTime(t time.Time) *time.Time { return &t }
-func TestIdempotencyCASAndIsolation(t *testing.T) {
+func TestDefaultWorkspaceIdempotencyAndCAS(t *testing.T) {
 	f := setup(t)
-	p := hub.Params{WorkspaceID: f.ws, Type: "source", Body: "same history", Provenance: "log", IdempotencyKey: "same"}
+	p := hub.Params{Type: "source", Body: "same history", Provenance: "log", IdempotencyKey: "same"}
 	var wg sync.WaitGroup
 	results := make(chan hub.Ref, 12)
 	errs := make(chan error, 12)
@@ -170,7 +162,7 @@ func TestIdempotencyCASAndIsolation(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			r, err := f.s.Execute(f.ctx, f.actor, "save", p)
+			r, err := f.s.Execute(f.ctx, "save", p)
 			if err != nil {
 				errs <- err
 			} else {
@@ -192,7 +184,7 @@ func TestIdempotencyCASAndIsolation(t *testing.T) {
 		source = r
 	}
 	p.Body = "different"
-	_, err := f.s.Execute(f.ctx, f.actor, "save", p)
+	_, err := f.s.Execute(f.ctx, "save", p)
 	code(t, err, "idempotency_conflict")
 	k := f.knowledge(source, map[string]any{"version": "1"})
 	errs = make(chan error, 2)
@@ -200,7 +192,7 @@ func TestIdempotencyCASAndIsolation(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_, e := f.s.Execute(f.ctx, f.actor, "save", hub.Params{WorkspaceID: f.ws, Type: "knowledge", ID: k.ID, ExpectedRevision: 1, Body: "revised", Scope: map[string]any{"version": "1"}, Sources: []string{source.ID}, Reason: "reviewed", IdempotencyKey: hub.NewID()})
+			_, e := f.s.Execute(f.ctx, "save", hub.Params{Type: "knowledge", ID: k.ID, ExpectedRevision: 1, Body: "revised", Scope: map[string]any{"version": "1"}, Sources: []string{source.ID}, Reason: "reviewed", IdempotencyKey: hub.NewID()})
 			errs <- e
 		}()
 	}
@@ -217,22 +209,18 @@ func TestIdempotencyCASAndIsolation(t *testing.T) {
 	if success != 1 {
 		t.Fatal("lost update")
 	}
-	ws2 := hub.NewID()
-	if _, err = f.s.DB.Exec(`INSERT INTO workspaces(id,name) VALUES($1,'other')`, ws2); err != nil {
-		t.Fatal(err)
-	}
-	f.s.DB.Exec(`INSERT INTO key_permissions VALUES($1,$2,true)`, f.actor, ws2)
-	_, err = f.s.Execute(f.ctx, f.actor, "save", hub.Params{WorkspaceID: ws2, Type: "knowledge", Body: "cross workspace", Scope: map[string]any{}, Sources: []string{source.ID}, Reason: "bad", IdempotencyKey: hub.NewID()})
+
+	_, err = f.s.Execute(f.ctx, "save", hub.Params{Type: "knowledge", Body: "missing evidence", Scope: map[string]any{}, Sources: []string{hub.NewID()}, Reason: "bad reference", IdempotencyKey: hub.NewID()})
 	code(t, err, "invalid_reference")
-	out, err := f.s.Execute(f.ctx, f.actor, "search", hub.Params{WorkspaceID: ws2})
-	if err != nil {
-		t.Fatal(err)
+	var count int
+	var name string
+	if err = f.s.DB.QueryRow(`SELECT count(*),min(name) FROM workspaces`).Scan(&count, &name); err != nil || count != 1 || name != "default" {
+		t.Fatal("default workspace initialization", count, name, err)
 	}
-	if len(out.Data.([]json.RawMessage)) != 0 {
-		t.Fatal("workspace search leak")
+	if _, err = f.s.DB.Exec(`INSERT INTO workspaces(id,name) VALUES($1,'other')`, hub.NewID()); err == nil {
+		t.Fatal("unexpected second workspace")
 	}
-	_, err = f.s.Execute(f.ctx, f.actor, "read", hub.Params{WorkspaceID: ws2, Type: "source", ID: source.ID})
-	code(t, err, "not_found")
+
 }
 func TestImmutableEvidenceAndAttachments(t *testing.T) {
 	f := setup(t)
@@ -247,7 +235,7 @@ func TestImmutableEvidenceAndAttachments(t *testing.T) {
 		t.Fatal("binary changed")
 	}
 	other := f.source("different")
-	_, err := f.s.Execute(f.ctx, f.actor, "read", hub.Params{WorkspaceID: f.ws, Type: "source", ID: other.ID, AttachmentID: a.ID})
+	_, err := f.s.Execute(f.ctx, "read", hub.Params{Type: "source", ID: other.ID, AttachmentID: a.ID})
 	code(t, err, "not_found")
 	checks := []string{`UPDATE sources SET body='changed' WHERE workspace_id=$1 AND id=$2`, `DELETE FROM sources WHERE workspace_id=$1 AND id=$2`, `INSERT INTO attachments(workspace_id,id,source_id,name,mime,size,sha256,content) VALUES($1,gen_random_uuid(),$2,'late','text/plain',1,'x','x')`}
 	for _, q := range checks {
@@ -264,13 +252,7 @@ func TestImmutableEvidenceAndAttachments(t *testing.T) {
 			t.Fatal("historical evidence mutable", q)
 		}
 	}
-	f.s.DB.Exec(`UPDATE key_permissions SET can_write=false WHERE key_id=$1`, f.actor)
-	_, err = f.s.Execute(f.ctx, f.actor, "save", hub.Params{WorkspaceID: f.ws, IdempotencyKey: "denied", Type: "source", Body: "x", Provenance: "x"})
-	code(t, err, "forbidden")
-	f.call("read", hub.Params{Type: "source", ID: source.ID})
-	f.s.DB.Exec(`UPDATE api_keys SET revoked_at=now() WHERE id=$1`, f.actor)
-	_, err = f.s.Authenticate(f.ctx, f.key)
-	code(t, err, "unauthorized")
+
 }
 func TestKnowledgeValidationAndRollback(t *testing.T) {
 	f := setup(t)
@@ -283,9 +265,8 @@ func TestKnowledgeValidationAndRollback(t *testing.T) {
 		{Type: "source", ID: source.ID, Body: "overwrite", Provenance: "x"},
 	}
 	for _, p := range cases {
-		p.WorkspaceID = f.ws
 		p.IdempotencyKey = hub.NewID()
-		_, err := f.s.Execute(f.ctx, f.actor, "save", p)
+		_, err := f.s.Execute(f.ctx, "save", p)
 		code(t, err, "invalid_input")
 	}
 	var count int
@@ -293,7 +274,7 @@ func TestKnowledgeValidationAndRollback(t *testing.T) {
 		t.Fatal("partial writes", count, err)
 	}
 	// New schema has no workflow, indexing, migration or vector objects.
-	for _, table := range []string{"claims", "verifications", "assessments", "review_events", "index_jobs", "chunks", "schema_migrations"} {
+	for _, table := range []string{"claims", "verifications", "assessments", "review_events", "index_jobs", "chunks", "schema_migrations", "api_keys", "key_permissions"} {
 		var name sql.NullString
 		if err := f.s.DB.QueryRow(`SELECT to_regclass(format('%I.%I',current_schema(),$1::text))::text`, table).Scan(&name); err != nil || name.Valid {
 			t.Fatal("legacy table exists", table, err)

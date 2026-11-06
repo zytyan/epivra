@@ -2,13 +2,8 @@ package main
 
 import (
 	"context"
-	"crypto/rand"
-	"crypto/sha256"
 	"database/sql"
-	"encoding/base64"
-	"encoding/json"
 	"errors"
-	"flag"
 	"fmt"
 	"log/slog"
 	"net"
@@ -68,6 +63,17 @@ func run() error {
 		}
 		return nil
 	}
+	command := "serve"
+	if len(os.Args) > 1 {
+		command = os.Args[1]
+	}
+	if command == "help" || command == "--help" {
+		fmt.Fprintln(os.Stdout, "commands: serve (default), init-db, healthcheck; configuration: DATABASE_URL, LISTEN_ADDR")
+		return nil
+	}
+	if command != "serve" && command != "init-db" {
+		return fmt.Errorf("commands: serve, init-db, healthcheck")
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	dsn := os.Getenv("DATABASE_URL")
@@ -88,15 +94,8 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("database unavailable")
 	}
-	command := "serve"
-	if len(os.Args) > 1 {
-		command = os.Args[1]
-	}
 	if command == "init-db" {
 		return schema.Initialize(ctx, db)
-	}
-	if command != "serve" {
-		return admin(ctx, db, command, os.Args[2:])
 	}
 	if err = schema.Initialize(ctx, db); err != nil {
 		return err
@@ -133,63 +132,4 @@ func run() error {
 		return nil
 	}
 	return err
-}
-func admin(ctx context.Context, db *sql.DB, command string, args []string) error {
-	fs := flag.NewFlagSet(command, flag.ContinueOnError)
-	name := fs.String("name", "", "display name")
-	workspace := fs.String("workspace", "", "workspace UUID")
-	write := fs.Bool("write", false, "grant read and write")
-	id := fs.String("id", "", "API key UUID")
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-	switch command {
-	case "workspace-create":
-		if strings.TrimSpace(*name) == "" {
-			return fmt.Errorf("--name required")
-		}
-		uid := hub.NewID()
-		if _, err := db.ExecContext(ctx, `INSERT INTO workspaces(id,name) VALUES($1,$2)`, uid, *name); err != nil {
-			return err
-		}
-		return json.NewEncoder(os.Stdout).Encode(map[string]string{"workspace_id": uid})
-	case "key-issue":
-		if !hub.UUID(*workspace) || *name == "" {
-			return fmt.Errorf("--workspace and --name required")
-		}
-		b := make([]byte, 32)
-		if _, err := rand.Read(b); err != nil {
-			return err
-		}
-		token := "kh_" + base64.RawURLEncoding.EncodeToString(b)
-		hash := sha256.Sum256([]byte(token))
-		uid := hub.NewID()
-		tx, err := db.BeginTx(ctx, nil)
-		if err != nil {
-			return err
-		}
-		defer tx.Rollback()
-		if _, err = tx.ExecContext(ctx, `INSERT INTO api_keys(id,name,digest) VALUES($1,$2,$3)`, uid, *name, hash[:]); err != nil {
-			return err
-		}
-		if _, err = tx.ExecContext(ctx, `INSERT INTO key_permissions(key_id,workspace_id,can_write) VALUES($1,$2,$3)`, uid, *workspace, *write); err != nil {
-			return err
-		}
-		if err = tx.Commit(); err != nil {
-			return err
-		}
-		return json.NewEncoder(os.Stdout).Encode(map[string]string{"key_id": uid, "api_key": token})
-	case "key-revoke":
-		if !hub.UUID(*id) {
-			return fmt.Errorf("--id required")
-		}
-		res, err := db.ExecContext(ctx, `UPDATE api_keys SET revoked_at=now() WHERE id=$1 AND revoked_at IS NULL`, *id)
-		if err != nil {
-			return err
-		}
-		n, _ := res.RowsAffected()
-		return json.NewEncoder(os.Stdout).Encode(map[string]int64{"revoked": n})
-	default:
-		return fmt.Errorf("commands: serve, init-db, workspace-create, key-issue, key-revoke, healthcheck")
-	}
 }

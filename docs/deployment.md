@@ -29,9 +29,6 @@ GRANT USAGE, CREATE ON SCHEMA public TO knowledgehub;
 export DATABASE_URL='postgres://knowledgehub:replace_me@db-host:5432/knowledgehub?sslmode=verify-full'
 export LISTEN_ADDR=127.0.0.1:8080
 ./bin/knowledgehub init-db
-./bin/knowledgehub workspace-create --name research
-./bin/knowledgehub key-issue --workspace WORKSPACE_UUID --name reader
-./bin/knowledgehub key-issue --workspace WORKSPACE_UUID --name dream --write
 ./bin/knowledgehub serve
 ```
 
@@ -48,6 +45,6 @@ export LISTEN_ADDR=127.0.0.1:8080
 | TRUSTED_ORIGINS | 空 | 可信浏览器 Origin，逗号分隔 |
 | MAX_UPLOAD_BYTES | 20971520 | 单次 Source 附件总字节上限 |
 
-程序只读取环境变量，不自动读取 .env。可由进程管理器注入，或从可信 shell 文件载入 .env.example 的副本。日志写入标准错误；密钥发放结果输出一次，数据库只存摘要。`key-revoke --id KEY_UUID` 撤销密钥。
+程序只读取环境变量，不自动读取 .env。可由进程管理器注入，或从可信 shell 文件载入 .env.example 的副本。日志写入标准错误。启动后即可调用 HTTP；唯一的 default Workspace 自动创建，应用不要求认证，也无需创建空间或发放密钥。客户端共享数据，不区分用户；DATABASE_URL 仍用于连接独立 PostgreSQL。
 
 `/healthz` 检查进程，`/readyz` 检查数据库和初始化标记。`./bin/knowledgehub healthcheck` 使用 LISTEN_ADDR 端口查询本机 readyz。SIGTERM/SIGINT 正常关闭服务。MCP 会话保存在进程内，重启后客户端重新初始化。

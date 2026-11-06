@@ -15,6 +15,9 @@ import (
 	"strings"
 )
 
+// All requests use the single shared internal workspace.
+const defaultWorkspaceID = "00000000-0000-0000-0000-000000000001"
+
 type Service struct {
 	DB        *sql.DB
 	MaxUpload int64
@@ -63,36 +66,12 @@ func normalizeError(err error) error {
 	slog.Error("database operation failed", "error", err)
 	return fail("internal", "database operation failed")
 }
-func (s *Service) Authenticate(ctx context.Context, token string) (string, error) {
-	if token == "" {
-		return "", fail("unauthorized", "Bearer API key required")
-	}
-	hash := sha256.Sum256([]byte(token))
-	var id string
-	err := s.DB.QueryRowContext(ctx, `SELECT id FROM api_keys WHERE digest=$1 AND revoked_at IS NULL`, hash[:]).Scan(&id)
-	if errors.Is(err, sql.ErrNoRows) {
-		return "", fail("unauthorized", "invalid API key")
-	}
-	return id, normalizeError(err)
-}
-func authorize(ctx context.Context, tx *sql.Tx, actor, workspace string, write bool) error {
-	var allowed bool
-	err := tx.QueryRowContext(ctx, `SELECT p.can_write FROM key_permissions p JOIN api_keys k ON k.id=p.key_id WHERE p.key_id=$1 AND p.workspace_id=$2 AND k.revoked_at IS NULL FOR SHARE OF k,p`, actor, workspace).Scan(&allowed)
-	if errors.Is(err, sql.ErrNoRows) || err == nil && write && !allowed {
-		return fail("forbidden", "workspace permission denied")
-	}
-	return err
-}
-func (s *Service) Execute(ctx context.Context, actor, op string, p Params) (out Result, err error) {
+func (s *Service) Execute(ctx context.Context, op string, p Params) (out Result, err error) {
 	defer func() { err = normalizeError(err) }()
 	if !KnownOperation(op) {
 		return out, fail("unknown_operation", "unknown operation")
 	}
-	if !UUID(actor) || !UUID(p.WorkspaceID) {
-		return out, fail("invalid_input", "valid workspace_id required")
-	}
-	actor = strings.ToLower(actor)
-	p.WorkspaceID = strings.ToLower(p.WorkspaceID)
+	p.workspaceID = defaultWorkspaceID
 	p.ID = strings.ToLower(p.ID)
 	if p.Limit == 0 {
 		p.Limit = 20
@@ -132,9 +111,6 @@ func (s *Service) Execute(ctx context.Context, actor, op string, p Params) (out 
 	if _, err = tx.ExecContext(ctx, `SET LOCAL TIME ZONE 'UTC'`); err != nil {
 		return out, err
 	}
-	if err = authorize(ctx, tx, actor, p.WorkspaceID, IsWrite(op)); err != nil {
-		return out, err
-	}
 	var digest string
 	if IsWrite(op) {
 		h := sha256.Sum256([]byte(marshal(struct {
@@ -142,12 +118,12 @@ func (s *Service) Execute(ctx context.Context, actor, op string, p Params) (out 
 			Scope  map[string]any `json:"scope"`
 		}{p, p.Scope})))
 		digest = hex.EncodeToString(h[:])
-		scope := p.WorkspaceID + ":" + actor + ":" + op + ":" + p.IdempotencyKey
+		scope := p.workspaceID + ":" + op + ":" + p.IdempotencyKey
 		if _, err = tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1,0))`, scope); err != nil {
 			return out, err
 		}
 		var previous, raw string
-		err = tx.QueryRowContext(ctx, `SELECT digest,response FROM idempotency WHERE workspace_id=$1 AND actor=$2 AND operation=$3 AND key=$4`, p.WorkspaceID, actor, op, p.IdempotencyKey).Scan(&previous, &raw)
+		err = tx.QueryRowContext(ctx, `SELECT digest,response FROM idempotency WHERE workspace_id=$1 AND operation=$2 AND key=$3`, p.workspaceID, op, p.IdempotencyKey).Scan(&previous, &raw)
 		if err == nil {
 			if previous != digest {
 				return out, fail("idempotency_conflict", "key was already used with different input")
@@ -158,7 +134,7 @@ func (s *Service) Execute(ctx context.Context, actor, op string, p Params) (out 
 		if !errors.Is(err, sql.ErrNoRows) {
 			return out, err
 		}
-		out, err = s.write(ctx, tx, actor, op, p)
+		out, err = s.write(ctx, tx, p)
 	} else {
 		out, err = s.read(ctx, tx, op, p)
 	}
@@ -166,7 +142,7 @@ func (s *Service) Execute(ctx context.Context, actor, op string, p Params) (out 
 		return out, err
 	}
 	if IsWrite(op) {
-		_, err = tx.ExecContext(ctx, `INSERT INTO idempotency(workspace_id,actor,operation,key,digest,response) VALUES($1,$2,$3,$4,$5,$6::jsonb)`, p.WorkspaceID, actor, op, p.IdempotencyKey, digest, marshal(out))
+		_, err = tx.ExecContext(ctx, `INSERT INTO idempotency(workspace_id,operation,key,digest,response) VALUES($1,$2,$3,$4,$5::jsonb)`, p.workspaceID, op, p.IdempotencyKey, digest, marshal(out))
 		if err != nil {
 			return out, err
 		}
@@ -175,7 +151,7 @@ func (s *Service) Execute(ctx context.Context, actor, op string, p Params) (out 
 	return out, err
 }
 
-func (s *Service) write(ctx context.Context, tx *sql.Tx, actor, op string, p Params) (Result, error) {
+func (s *Service) write(ctx context.Context, tx *sql.Tx, p Params) (Result, error) {
 	if p.Type != "source" && p.Type != "knowledge" {
 		return Result{}, fail("invalid_input", "type must be source or knowledge")
 	}
@@ -196,7 +172,7 @@ func (s *Service) write(ctx context.Context, tx *sql.Tx, actor, op string, p Par
 		if p.Tags == nil {
 			p.Tags = []string{}
 		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO sources(workspace_id,id,body,provenance,source_time,metadata,tags,author) VALUES($1,$2,$3,$4,$5,$6::jsonb,ARRAY(SELECT jsonb_array_elements_text($7::jsonb)),$8)`, p.WorkspaceID, id, p.Body, p.Provenance, p.SourceTime, marshal(p.Metadata), marshal(p.Tags), actor); err != nil {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO sources(workspace_id,id,body,provenance,source_time,metadata,tags) VALUES($1,$2,$3,$4,$5,$6::jsonb,ARRAY(SELECT jsonb_array_elements_text($7::jsonb)))`, p.workspaceID, id, p.Body, p.Provenance, p.SourceTime, marshal(p.Metadata), marshal(p.Tags)); err != nil {
 			return Result{}, err
 		}
 		if len(p.Attachments) > 100 {
@@ -222,7 +198,7 @@ func (s *Service) write(ctx context.Context, tx *sql.Tx, actor, op string, p Par
 				return Result{}, fail("upload_too_large", "total attachments too large")
 			}
 			h := sha256.Sum256(b)
-			if _, err = tx.ExecContext(ctx, `INSERT INTO attachments(workspace_id,id,source_id,name,mime,size,sha256,content) VALUES($1,$2,$3,$4,$5,$6,$7,$8)`, p.WorkspaceID, NewID(), id, a.Name, a.MIME, len(b), hex.EncodeToString(h[:]), b); err != nil {
+			if _, err = tx.ExecContext(ctx, `INSERT INTO attachments(workspace_id,id,source_id,name,mime,size,sha256,content) VALUES($1,$2,$3,$4,$5,$6,$7,$8)`, p.workspaceID, NewID(), id, a.Name, a.MIME, len(b), hex.EncodeToString(h[:]), b); err != nil {
 				return Result{}, err
 			}
 		}
@@ -244,7 +220,7 @@ func (s *Service) write(ctx context.Context, tx *sql.Tx, actor, op string, p Par
 			return Result{}, fail("invalid_input", "omit expected_revision for new knowledge")
 		}
 		id = NewID()
-		if _, err := tx.ExecContext(ctx, `INSERT INTO knowledge(workspace_id,id,current_revision) VALUES($1,$2,1)`, p.WorkspaceID, id); err != nil {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO knowledge(workspace_id,id,current_revision) VALUES($1,$2,1)`, p.workspaceID, id); err != nil {
 			return Result{}, err
 		}
 	} else {
@@ -252,7 +228,7 @@ func (s *Service) write(ctx context.Context, tx *sql.Tx, actor, op string, p Par
 			return Result{}, fail("invalid_input", "expected_revision required for update")
 		}
 		var current int
-		if err := tx.QueryRowContext(ctx, `SELECT current_revision FROM knowledge WHERE workspace_id=$1 AND id=$2 FOR UPDATE`, p.WorkspaceID, id).Scan(&current); err != nil {
+		if err := tx.QueryRowContext(ctx, `SELECT current_revision FROM knowledge WHERE workspace_id=$1 AND id=$2 FOR UPDATE`, p.workspaceID, id).Scan(&current); err != nil {
 			return Result{}, err
 		}
 		if current != p.ExpectedRevision {
@@ -263,7 +239,7 @@ func (s *Service) write(ctx context.Context, tx *sql.Tx, actor, op string, p Par
 	if p.Tags == nil {
 		p.Tags = []string{}
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO knowledge_revisions(workspace_id,knowledge_id,revision,body,scope,conditions,tags,reason,author) VALUES($1,$2,$3,$4,$5::jsonb,$6,ARRAY(SELECT jsonb_array_elements_text($7::jsonb)),$8,$9)`, p.WorkspaceID, id, revision, p.Body, marshal(p.Scope), p.Conditions, marshal(p.Tags), p.Reason, actor); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO knowledge_revisions(workspace_id,knowledge_id,revision,body,scope,conditions,tags,reason) VALUES($1,$2,$3,$4,$5::jsonb,$6,ARRAY(SELECT jsonb_array_elements_text($7::jsonb)),$8)`, p.workspaceID, id, revision, p.Body, marshal(p.Scope), p.Conditions, marshal(p.Tags), p.Reason); err != nil {
 		return Result{}, err
 	}
 	seen := map[string]bool{}
@@ -276,12 +252,12 @@ func (s *Service) write(ctx context.Context, tx *sql.Tx, actor, op string, p Par
 			continue
 		}
 		seen[source] = true
-		if _, err := tx.ExecContext(ctx, `INSERT INTO knowledge_sources(workspace_id,knowledge_id,revision,source_id) VALUES($1,$2,$3,$4)`, p.WorkspaceID, id, revision, source); err != nil {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO knowledge_sources(workspace_id,knowledge_id,revision,source_id) VALUES($1,$2,$3,$4)`, p.workspaceID, id, revision, source); err != nil {
 			return Result{}, err
 		}
 	}
 	if revision > 1 {
-		if _, err := tx.ExecContext(ctx, `UPDATE knowledge SET current_revision=$3 WHERE workspace_id=$1 AND id=$2`, p.WorkspaceID, id, revision); err != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE knowledge SET current_revision=$3 WHERE workspace_id=$1 AND id=$2`, p.workspaceID, id, revision); err != nil {
 			return Result{}, err
 		}
 	}

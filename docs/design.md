@@ -2,11 +2,11 @@
 
 ## 数据模型
 
-Source 保存不可变的正文、来源描述、来源时间、标签、元数据、作者、接收时间及附件。正文可以是客户端导入的会话片段、日志摘要或用户提供的材料；服务不抓取外部 URL。附件保存为 bytea，带 MIME、大小和 SHA-256。来源及其附件不能在提交后被更新或追加，修正材料应新建 Source。
+Source 保存不可变的正文、来源描述、来源时间、标签、元数据、接收时间及附件。正文可以是客户端导入的会话片段、日志摘要或用户提供的材料；服务不抓取外部 URL。附件保存为 bytea，带 MIME、大小和 SHA-256。来源及其附件不能在提交后被更新或追加，修正材料应新建 Source。
 
-Knowledge 使用稳定 UUID 和 current_revision 指针；不可变修订记录保存正文、JSONB scope、适用条件、标签、Source 关联、作者、时间及修订原因。正文上限 2000 个 Unicode 字符，由客户端负责使内容简短、原子化。每次保存完整快照，至少引用一个同 Workspace 的 Source。
+Knowledge 使用稳定 UUID 和 current_revision 指针；不可变修订记录保存正文、JSONB scope、适用条件、标签、Source 关联、时间及修订原因。正文上限 2000 个 Unicode 字符，由客户端负责使内容简短、原子化。每次保存完整快照，至少引用一个 Source。
 
-没有 Claim、Verification、Assessment、Review，也没有知识分支、状态评估或后台任务对象。Workspace、API Key、附件、来源关联、修订和幂等记录是必要的存储及授权结构。
+没有 Claim、Verification、Assessment、Review，也没有知识分支、状态评估或后台任务对象。系统自动创建唯一的 default Workspace，附件、来源关联、修订和幂等记录属于该共享空间。没有用户、API Key 或权限表。
 
 ## Scope 与软件版本
 
@@ -20,15 +20,15 @@ scope 包含在每次不可变修订内。纠正 scope 必须显式修订并给�
 
 ## 一致性与历史
 
-所有关联带 Workspace 复合外键，跨 Workspace Source 引用被数据库拒绝。Source、Knowledge 修订及来源关联由数据库触发器保护，不允许修改已经提交的证据快照。
+所有请求由服务注入唯一的默认 Workspace，客户端不能选择空间。数据库约束只允许创建这一空间；所有 Source 与 Knowledge 使用其内部关联。Source、Knowledge 修订及来源关联由数据库触发器保护，不允许修改已经提交的证据快照。
 
-修订要求 expected_revision，事务内锁定指定 Knowledge，比较当前修订，追加完整新修订及来源关联，然后更新当前指针。冲突返回 revision_conflict 和 current_revision。Source/Knowledge 保存支持 Workspace、API Key、save 操作范围内的幂等键；相同参数重试返回原结果，不同参数返回 idempotency_conflict。
+修订要求 expected_revision，事务内锁定指定 Knowledge，比较当前修订，追加完整新修订及来源关联，然后更新当前指针。冲突返回 revision_conflict 和 current_revision。Source/Knowledge 保存支持 默认空间中 save 操作范围内的共享幂等键；相同参数重试返回原结果，不同参数返回 idempotency_conflict。
 
 read 可以读取指定修订及截至该修订的历史；正文、scope、原因及来源 ID 都固定到该修订。不会把当前 Source 关联替换进旧修订。读操作使用数据库一致快照。
 
 ## MCP 与 Dream
 
-`/mcp` 只注册 search、read；`/mcp/write` 额外注册 save。客户端决定每个会话可见的端点，正常工作只连接 `/mcp`。Dream 使用独立的可写会话和写入 Key，仍受 Workspace 权限检查。
+`/mcp` 只注册 search、read；`/mcp/write` 额外注册 save。客户端决定每个会话可见的端点，正常工作只连接 `/mcp`。Dream 使用独立的可写会话。HTTP 和 MCP 均无需认证；端点只区分工具可见性，不提供用户隔离。
 
 客户端维护历史分析进度：读取本地新增历史，检索适用 scope 的 Knowledge，读取候选完整内容和历史，再决定新增、修订或忽略。客户端负责 LLM、Dream 调度、去重和会话上下文。服务端只执行明确请求，不自动生成或裁决知识。
 

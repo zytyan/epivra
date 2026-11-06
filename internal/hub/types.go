@@ -38,7 +38,7 @@ type AttachmentInput struct {
 	Data string `json:"data"`
 }
 type Params struct {
-	WorkspaceID      string            `json:"workspace_id"`
+	workspaceID      string
 	Type             string            `json:"type,omitempty"`
 	ID               string            `json:"id,omitempty"`
 	IdempotencyKey   string            `json:"idempotency_key,omitempty"`

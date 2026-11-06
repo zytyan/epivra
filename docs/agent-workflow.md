@@ -1,6 +1,6 @@
 # 客户端 Dream 会话
 
-正常工作只向 Agent 暴露 `/mcp`，客户端保存本地会话历史。Dream 的调度、LLM、输入窗口和历史游标都由客户端管理，服务不自动安排整理任务。
+默认空间自动可用，无需认证。正常工作可只向 Agent 暴露 `/mcp`，客户端保存本地会话历史。Dream 的调度、LLM、输入窗口和历史游标都由客户端管理，服务不自动安排整理任务。
 
 一次增量 Dream：
 
@@ -18,8 +18,6 @@
 
 ```sh
 export BASE_URL=http://localhost:8080
-export WORKSPACE_ID=WORKSPACE_UUID
-export API_KEY=WRITE_API_KEY
 python3 scripts/agent-example.py
 ```
 

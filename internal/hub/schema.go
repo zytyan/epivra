@@ -16,8 +16,8 @@ var required = map[string]string{"read": "type id", "save": "type body"}
 
 func Schema(op string) map[string]any {
 	all := schemaType(reflect.TypeOf(Params{}))["properties"].(map[string]any)
-	props := map[string]any{"workspace_id": all["workspace_id"]}
-	req := []string{"workspace_id"}
+	props := map[string]any{}
+	req := []string{}
 	for _, name := range strings.Fields(fields[op]) {
 		props[name] = all[name]
 	}

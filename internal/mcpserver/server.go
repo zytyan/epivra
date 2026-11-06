@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
-	"sync"
 	"time"
 
 	"epivra/internal/httpapi"
@@ -39,7 +38,7 @@ func (c Config) Validate() error {
 	}
 	return nil
 }
-func server(s *hub.Service, actor string, write bool) *mcp.Server {
+func server(s *hub.Service, write bool) *mcp.Server {
 	srv := mcp.NewServer(&mcp.Implementation{Name: "knowledge-hub", Version: "0.2.0"}, nil)
 	for _, operation := range hub.Operations {
 		if operation == "save" && !write {
@@ -50,7 +49,7 @@ func server(s *hub.Service, actor string, write bool) *mcp.Server {
 			p, err := hub.DecodeOperation(op, req.Params.Arguments)
 			var out hub.Result
 			if err == nil {
-				out, err = s.Execute(ctx, actor, op, p)
+				out, err = s.Execute(ctx, op, p)
 			}
 			if err != nil {
 				var e *hub.Error
@@ -90,21 +89,11 @@ func Register(mux *http.ServeMux, s *hub.Service, c Config) error {
 	if err := c.Validate(); err != nil {
 		return err
 	}
+
 	for path, write := range map[string]bool{c.ReadPath: false, c.WritePath: true} {
-		var mu sync.Mutex
-		handlers := map[string]*mcp.StreamableHTTPHandler{}
-		mux.Handle(path, httpapi.Origin(c.Origins, httpapi.Authenticate(s, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			actor := httpapi.Actor(r.Context())
-			mu.Lock()
-			h := handlers[actor]
-			if h == nil {
-				srv := server(s, actor, write)
-				h = mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv }, &mcp.StreamableHTTPOptions{JSONResponse: true, SessionTimeout: 30 * time.Minute})
-				handlers[actor] = h
-			}
-			mu.Unlock()
-			h.ServeHTTP(w, r)
-		}))))
+		srv := server(s, write)
+		handler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv }, &mcp.StreamableHTTPOptions{JSONResponse: true, SessionTimeout: 30 * time.Minute})
+		mux.Handle(path, httpapi.Origin(c.Origins, handler))
 	}
 	return nil
 }

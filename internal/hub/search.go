@@ -39,7 +39,7 @@ func search(ctx context.Context, tx *sql.Tx, p Params) (Result, error) {
  'score',ts_rank(to_tsvector('simple',body),plainto_tsquery('simple',$2))+similarity(body,$2)+CASE WHEN $2<>'' AND strpos(lower(body),lower($2))>0 THEN 1 ELSE 0 END) AS hit
  FROM entries WHERE type IN(SELECT jsonb_array_elements_text($3::jsonb)) AND scope @> $4::jsonb AND tags @> ARRAY(SELECT jsonb_array_elements_text($5::jsonb)) AND ($6::timestamptz IS NULL OR created_at>$6)
  AND ($2='' OR to_tsvector('simple',body) @@ plainto_tsquery('simple',$2) OR body % $2 OR strpos(lower(body),lower($2))>0)
- ORDER BY (ts_rank(to_tsvector('simple',body),plainto_tsquery('simple',$2))+similarity(body,$2)+CASE WHEN $2<>'' AND strpos(lower(body),lower($2))>0 THEN 1 ELSE 0 END) DESC,type,id LIMIT $7 OFFSET $8`, p.WorkspaceID, p.Query, marshal(p.Types), marshal(p.Scope), marshal(p.Tags), p.Since, p.Limit+1, p.Offset)
+ ORDER BY (ts_rank(to_tsvector('simple',body),plainto_tsquery('simple',$2))+similarity(body,$2)+CASE WHEN $2<>'' AND strpos(lower(body),lower($2))>0 THEN 1 ELSE 0 END) DESC,type,id LIMIT $7 OFFSET $8`, p.workspaceID, p.Query, marshal(p.Types), marshal(p.Scope), marshal(p.Tags), p.Since, p.Limit+1, p.Offset)
 	if err != nil {
 		return Result{}, err
 	}

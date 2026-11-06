@@ -6,17 +6,14 @@ import urllib.request
 import uuid
 
 base = os.environ.get('BASE_URL', 'http://localhost:8080').rstrip('/')
-workspace = os.environ['WORKSPACE_ID']
-key = os.environ['API_KEY']
 
 
 def call(operation, **params):
-    params['workspace_id'] = workspace
     if operation == 'save':
         params['idempotency_key'] = str(uuid.uuid4())
     request = urllib.request.Request(
         base + '/v1/' + operation, data=json.dumps(params).encode(),
-        headers={'Authorization': 'Bearer ' + key, 'Content-Type': 'application/json'})
+        headers={'Content-Type': 'application/json'})
     with urllib.request.urlopen(request, timeout=30) as response:
         return json.load(response)['data']
 

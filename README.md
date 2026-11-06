@@ -11,11 +11,6 @@ Source 保存不可变的历史记录、证据文本及可选附件。Knowledge 
 ```sh
 ./scripts/build.sh
 export DATABASE_URL='postgres://knowledgehub:password@127.0.0.1:5432/knowledgehub?sslmode=disable'
-export LISTEN_ADDR=127.0.0.1:8080
-./bin/knowledgehub init-db
-./bin/knowledgehub workspace-create --name research
-./bin/knowledgehub key-issue --workspace WORKSPACE_UUID --name reader
-./bin/knowledgehub key-issue --workspace WORKSPACE_UUID --name dream --write
 ./bin/knowledgehub serve
 ```
 
@@ -23,16 +18,26 @@ export LISTEN_ADDR=127.0.0.1:8080
 
 配置全部经环境变量传入，见 [.env.example](.env.example)。程序不自动加载 .env。`serve` 会初始化空库；`init-db` 可提前完成初始化。当前处于测试阶段，无旧结构兼容或升级迁移，需要重建原测试库，程序不会自动清空已有数据。见 [Agent.md](Agent.md)。
 
-## MCP
+## 直接使用
 
 | 默认端点 | 工具 | 客户端用途 |
 |---|---|---|
 | `/mcp` | `search`、`read` | 正常工作，只读取知识 |
 | `/mcp/write` | `search`、`read`、`save` | 独立 Dream 会话整理知识 |
 
-使用 Streamable HTTP（2025-11-25），所有请求携带 `Authorization: Bearer API_KEY`。客户端只在 Dream 会话暴露写入端点。即使使用写入 Key，`/mcp` 也不会列出或接受 `save`；`/mcp/write` 的保存仍要求 Workspace 写权限。两个端点的 MCP 会话互不通用。
+当前面向内网共享使用，启动时自动创建唯一的 `default` Workspace。所有请求直接读写该空间，不需要登录、API Key、Authorization 头或 workspace_id；没有用户、密钥或权限管理。
+
+使用 Streamable HTTP（2025-11-25），客户端可在普通会话只连接 `/mcp`，整理阶段再使用 `/mcp/write`。`/mcp` 不列出或接受 save；两个端点的会话互不通用。这是工具可见性区分，不是用户权限边界，内网访问者共享同一份数据。
 
 REST 同样只提供 `POST /v1/search`、`POST /v1/read`、`POST /v1/save`，与 MCP 使用相同参数和业务逻辑。
+
+最简单的 HTTP 调用无需先创建空间：
+
+```sh
+curl http://localhost:8080/v1/search -H 'Content-Type: application/json' -d '{"query":"缓存"}'
+curl http://localhost:8080/v1/save -H 'Content-Type: application/json' \
+  -d '{"type":"source","body":"观察到的日志内容","provenance":"会话记录","idempotency_key":"session-1:message-1"}'
+```
 
 ## 软件版本与修订
 
@@ -63,4 +68,4 @@ go test -race ./...
 TEST_DATABASE_URL='postgres://test:test@localhost:5432/knowledgehub_test?sslmode=disable' ./scripts/test-integration.sh
 ```
 
-集成测试在专用数据库中创建独立 schema，需要 schema 创建权限和 pg_trgm；不创建数据库或依赖 pgvector。覆盖多 scope 并存、旧软件持续修订、固定历史证据、来源/附件不可变、幂等与并发冲突、Workspace 隔离、MCP 工具可见性和会话隔离。CI 使用独立 PostgreSQL，构建并上传 Linux amd64 二进制。
+集成测试在专用数据库中创建独立 schema，需要 schema 创建权限和 pg_trgm；不创建数据库或依赖 pgvector。覆盖多 scope 并存、旧软件持续修订、固定历史证据、来源/附件不可变、幂等与并发冲突、默认空间共享读写、MCP 工具可见性和端点会话隔离。CI 使用独立 PostgreSQL，构建并上传 Linux amd64 二进制。

@@ -1,11 +1,10 @@
 CREATE EXTENSION IF NOT EXISTS pg_trgm WITH SCHEMA public;
-CREATE TABLE workspaces(id uuid PRIMARY KEY,name text NOT NULL,created_at timestamptz NOT NULL DEFAULT now());
-CREATE TABLE api_keys(id uuid PRIMARY KEY,name text NOT NULL,digest bytea UNIQUE NOT NULL,revoked_at timestamptz,created_at timestamptz NOT NULL DEFAULT now());
-CREATE TABLE key_permissions(key_id uuid REFERENCES api_keys(id),workspace_id uuid REFERENCES workspaces(id),can_write boolean NOT NULL,PRIMARY KEY(key_id,workspace_id));
+CREATE TABLE workspaces(id uuid PRIMARY KEY CHECK(id='00000000-0000-0000-0000-000000000001'),name text NOT NULL CHECK(name='default'),created_at timestamptz NOT NULL DEFAULT now());
+INSERT INTO workspaces(id,name) VALUES('00000000-0000-0000-0000-000000000001','default');
 CREATE TABLE sources(
  workspace_id uuid NOT NULL REFERENCES workspaces(id),id uuid NOT NULL,body text NOT NULL,
  provenance text NOT NULL CHECK(provenance<>''),source_time timestamptz,metadata jsonb NOT NULL DEFAULT '{}' CHECK(jsonb_typeof(metadata)='object'),
- tags text[] NOT NULL DEFAULT '{}',author uuid NOT NULL REFERENCES api_keys(id),created_at timestamptz NOT NULL DEFAULT now(),created_tx bigint NOT NULL DEFAULT txid_current(),
+ tags text[] NOT NULL DEFAULT '{}',created_at timestamptz NOT NULL DEFAULT now(),created_tx bigint NOT NULL DEFAULT txid_current(),
  PRIMARY KEY(workspace_id,id)
 );
 CREATE TABLE attachments(
@@ -19,7 +18,7 @@ CREATE TABLE knowledge(
 CREATE TABLE knowledge_revisions(
  workspace_id uuid NOT NULL,knowledge_id uuid NOT NULL,revision integer NOT NULL CHECK(revision>0),body text NOT NULL CHECK(char_length(body) BETWEEN 1 AND 2000),
  scope jsonb NOT NULL CHECK(jsonb_typeof(scope)='object'),conditions text NOT NULL DEFAULT '',tags text[] NOT NULL DEFAULT '{}',reason text NOT NULL CHECK(reason<>''),
- author uuid NOT NULL REFERENCES api_keys(id),created_at timestamptz NOT NULL DEFAULT now(),created_tx bigint NOT NULL DEFAULT txid_current(),
+ created_at timestamptz NOT NULL DEFAULT now(),created_tx bigint NOT NULL DEFAULT txid_current(),
  PRIMARY KEY(workspace_id,knowledge_id,revision),FOREIGN KEY(workspace_id,knowledge_id) REFERENCES knowledge(workspace_id,id)
 );
 ALTER TABLE knowledge ADD FOREIGN KEY(workspace_id,id,current_revision) REFERENCES knowledge_revisions(workspace_id,knowledge_id,revision) DEFERRABLE INITIALLY DEFERRED;
@@ -29,7 +28,7 @@ CREATE TABLE knowledge_sources(
  FOREIGN KEY(workspace_id,knowledge_id,revision) REFERENCES knowledge_revisions(workspace_id,knowledge_id,revision),
  FOREIGN KEY(workspace_id,source_id) REFERENCES sources(workspace_id,id)
 );
-CREATE TABLE idempotency(workspace_id uuid REFERENCES workspaces(id),actor uuid REFERENCES api_keys(id),operation text,key text,digest text NOT NULL,response jsonb NOT NULL,PRIMARY KEY(workspace_id,actor,operation,key));
+CREATE TABLE idempotency(workspace_id uuid REFERENCES workspaces(id),operation text,key text,digest text NOT NULL,response jsonb NOT NULL,PRIMARY KEY(workspace_id,operation,key));
 CREATE INDEX knowledge_scope ON knowledge_revisions USING gin(scope jsonb_path_ops);
 CREATE INDEX knowledge_tags ON knowledge_revisions USING gin(tags);
 CREATE INDEX knowledge_text ON knowledge_revisions USING gin(body gin_trgm_ops);

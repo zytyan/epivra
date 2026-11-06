@@ -3,7 +3,6 @@ package integration
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"encoding/json"
 	"epivra/internal/httpapi"
 	"epivra/internal/hub"
@@ -28,14 +27,14 @@ func app(t *testing.T, f *fixture) *httptest.Server {
 }
 
 type wire struct {
-	t                  *testing.T
-	srv                *httptest.Server
-	path, key, session string
-	seq                int
+	t             *testing.T
+	srv           *httptest.Server
+	path, session string
+	seq           int
 }
 
-func openWire(t *testing.T, srv *httptest.Server, key, path string) *wire {
-	w := &wire{t: t, srv: srv, key: key, path: path}
+func openWire(t *testing.T, srv *httptest.Server, path string) *wire {
+	w := &wire{t: t, srv: srv, path: path}
 	r := w.rpc("initialize", map[string]any{"protocolVersion": "2025-11-25", "capabilities": map[string]any{}, "clientInfo": map[string]any{"name": "test", "version": "1"}}, false)
 	if r["result"].(map[string]any)["protocolVersion"] != "2025-11-25" {
 		t.Fatal(r)
@@ -54,7 +53,6 @@ func (w *wire) rpc(method string, params any, notify bool) map[string]any {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	req, _ := http.NewRequestWithContext(ctx, "POST", w.srv.URL+w.path, bytes.NewReader(b))
-	req.Header.Set("Authorization", "Bearer "+w.key)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/event-stream")
 	req.Header.Set("Mcp-Protocol-Version", "2025-11-25")
@@ -99,8 +97,8 @@ func (w *wire) tool(name string, p any) hub.Result {
 func TestReadAndWriteMCP(t *testing.T) {
 	f := setup(t)
 	srv := app(t, f)
-	ro := openWire(t, srv, f.key, "/mcp")
-	rw := openWire(t, srv, f.key, "/mcp/write")
+	ro := openWire(t, srv, "/mcp")
+	rw := openWire(t, srv, "/mcp/write")
 	for _, item := range []struct {
 		w *wire
 		n int
@@ -115,75 +113,63 @@ func TestReadAndWriteMCP(t *testing.T) {
 	if attempt["error"] == nil {
 		t.Fatal("read endpoint accepted hidden save", attempt)
 	}
-	source := ref(rw.tool("save", hub.Params{WorkspaceID: f.ws, Type: "source", Body: "runtime history", Provenance: "session", IdempotencyKey: "source"}))
-	p := map[string]any{"workspace_id": f.ws, "type": "knowledge", "body": "必须刷新缓存", "scope": map[string]any{"version": "v1"}, "sources": []string{source.ID}, "reason": "Dream extracted", "idempotency_key": "knowledge"}
+	source := ref(rw.tool("save", hub.Params{Type: "source", Body: "runtime history", Provenance: "session", IdempotencyKey: "source"}))
+	p := map[string]any{"type": "knowledge", "body": "必须刷新缓存", "scope": map[string]any{"version": "v1"}, "sources": []string{source.ID}, "reason": "Dream extracted", "idempotency_key": "knowledge"}
 	k := ref(rw.tool("save", p))
 	if ref(rw.tool("save", p)) != k {
 		t.Fatal("idempotency")
 	}
-	ro.tool("read", hub.Params{WorkspaceID: f.ws, Type: "knowledge", ID: k.ID, History: true})
-	out := ro.tool("search", hub.Params{WorkspaceID: f.ws, Query: "刷新", Scope: map[string]any{"version": "v1"}})
+	ro.tool("read", hub.Params{Type: "knowledge", ID: k.ID, History: true})
+	out := ro.tool("search", hub.Params{Query: "刷新", Scope: map[string]any{"version": "v1"}})
 	if len(out.Data.([]any)) != 1 {
 		t.Fatal("MCP search", out)
 	}
 	// New read sessions can query state saved by a separate Dream write session.
-	reconnected := openWire(t, srv, f.key, "/mcp")
-	reconnected.tool("read", hub.Params{WorkspaceID: f.ws, Type: "knowledge", ID: k.ID, Revision: 1})
+	reconnected := openWire(t, srv, "/mcp")
+	reconnected.tool("read", hub.Params{Type: "knowledge", ID: k.ID, Revision: 1})
 }
-func TestEndpointAuthenticationIsolationAndREST(t *testing.T) {
+
+func TestDefaultWorkspaceHTTPAndEndpointIsolation(t *testing.T) {
 	f := setup(t)
 	srv := app(t, f)
-	for _, path := range []string{"/mcp", "/mcp/write", "/v1/search", "/v1/save"} {
-		req, _ := http.NewRequest("POST", srv.URL+path, strings.NewReader(`{}`))
-		resp, err := srv.Client().Do(req)
-		if err != nil {
-			t.Fatal(err)
-		}
-		resp.Body.Close()
-		if resp.StatusCode != 401 {
-			t.Fatal(path, resp.StatusCode)
-		}
-	}
-	req, _ := http.NewRequest("POST", srv.URL+"/mcp", strings.NewReader(`{}`))
-	req.Header.Set("Authorization", "Bearer "+f.key)
-	req.Header.Set("Origin", "https://evil.example")
+	// No Authorization header or workspace parameter is sent by either client.
+	payload := map[string]any{"type": "source", "body": "REST history", "provenance": "REST", "idempotency_key": "rest"}
+	b, _ := json.Marshal(payload)
+	req, _ := http.NewRequest("POST", srv.URL+"/v1/save", bytes.NewReader(b))
+	req.Header.Set("Content-Type", "application/json")
 	resp, err := srv.Client().Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
+	var saved hub.Result
+	if err = json.NewDecoder(resp.Body).Decode(&saved); err != nil {
+		t.Fatal(err)
+	}
 	resp.Body.Close()
-	if resp.StatusCode != 403 {
-		t.Fatal("untrusted Origin")
+	if resp.StatusCode != 200 {
+		t.Fatal("anonymous save failed", resp.StatusCode, saved)
 	}
-	rw := openWire(t, srv, f.key, "/mcp/write")
-	actor2, key2 := hub.NewID(), "second_"+hub.NewID()
-	h := sha256.Sum256([]byte(key2))
-	f.s.DB.Exec(`INSERT INTO api_keys(id,name,digest) VALUES($1,'second',$2)`, actor2, h[:])
-	f.s.DB.Exec(`INSERT INTO key_permissions VALUES($1,$2,false)`, actor2, f.ws)
-	for _, other := range []struct{ key, path string }{{key2, "/mcp/write"}, {f.key, "/mcp"}} {
-		req, _ := http.NewRequest("POST", srv.URL+other.path, strings.NewReader(`{"jsonrpc":"2.0","id":9,"method":"tools/list","params":{}}`))
-		req.Header.Set("Authorization", "Bearer "+other.key)
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Accept", "application/json, text/event-stream")
-		req.Header.Set("Mcp-Session-Id", rw.session)
-		resp, err := srv.Client().Do(req)
-		if err != nil {
-			t.Fatal(err)
-		}
-		resp.Body.Close()
-		if resp.StatusCode != 404 && resp.StatusCode != 403 {
-			t.Fatal("session reused across endpoint or actor", resp.StatusCode)
-		}
+	source := ref(saved)
+	// A separate client reads the same shared default workspace.
+	req, _ = http.NewRequest("POST", srv.URL+"/v1/read", strings.NewReader(`{"type":"source","id":"`+source.ID+`"}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err = (&http.Client{Timeout: 5 * time.Second}).Do(req)
+	if err != nil {
+		t.Fatal(err)
 	}
-	readonly := openWire(t, srv, key2, "/mcp/write")
-	res := readonly.rpc("tools/call", map[string]any{"name": "save", "arguments": map[string]any{"workspace_id": f.ws, "type": "source", "body": "denied", "provenance": "x", "idempotency_key": "denied"}}, false)
-	if res["result"].(map[string]any)["isError"] != true {
-		t.Fatal("read-only key wrote")
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatal("shared anonymous read failed", resp.StatusCode)
 	}
-	payload := map[string]any{"workspace_id": f.ws, "type": "source", "body": "REST history", "provenance": "REST", "idempotency_key": "rest"}
-	b, _ := json.Marshal(payload)
-	req, _ = http.NewRequest("POST", srv.URL+"/v1/save", bytes.NewReader(b))
-	req.Header.Set("Authorization", "Bearer "+f.key)
+	var read hub.Result
+	if err = json.NewDecoder(resp.Body).Decode(&read); err != nil {
+		t.Fatal(err)
+	}
+	object := read.Data.(map[string]any)["object"].(map[string]any)
+	if object["body"] != "REST history" || object["workspace_id"] != nil || object["author"] != nil {
+		t.Fatal("internal identity exposed", object)
+	}
+	req, _ = http.NewRequest("POST", srv.URL+"/v1/search", strings.NewReader(`{}`))
 	req.Header.Set("Content-Type", "application/json")
 	resp, err = srv.Client().Do(req)
 	if err != nil {
@@ -191,18 +177,39 @@ func TestEndpointAuthenticationIsolationAndREST(t *testing.T) {
 	}
 	resp.Body.Close()
 	if resp.StatusCode != 200 {
-		t.Fatal("REST save", resp.StatusCode)
+		t.Fatal("anonymous search failed", resp.StatusCode)
 	}
-	f.s.DB.Exec(`UPDATE api_keys SET revoked_at=now() WHERE id=$1`, f.actor)
-	req, _ = http.NewRequest("POST", srv.URL+"/mcp/write", strings.NewReader(`{}`))
-	req.Header.Set("Authorization", "Bearer "+f.key)
+	req, _ = http.NewRequest("POST", srv.URL+"/v1/search", strings.NewReader(`{"workspace_id":"`+hub.NewID()+`"}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err = srv.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 400 {
+		t.Fatal("workspace selection unexpectedly accepted", resp.StatusCode)
+	}
+	req, _ = http.NewRequest("POST", srv.URL+"/mcp", strings.NewReader(`{}`))
+	req.Header.Set("Origin", "https://evil.example")
+	resp, err = srv.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 403 {
+		t.Fatal("untrusted Origin accepted")
+	}
+	rw := openWire(t, srv, "/mcp/write")
+	req, _ = http.NewRequest("POST", srv.URL+"/mcp", strings.NewReader(`{"jsonrpc":"2.0","id":9,"method":"tools/list","params":{}}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
 	req.Header.Set("Mcp-Session-Id", rw.session)
 	resp, err = srv.Client().Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
 	resp.Body.Close()
-	if resp.StatusCode != 401 {
-		t.Fatal("revoked key accepted")
+	if resp.StatusCode != 404 {
+		t.Fatal("write session reused at read endpoint", resp.StatusCode)
 	}
 }

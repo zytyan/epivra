@@ -37,7 +37,7 @@ func rawRows(rows *sql.Rows) ([]json.RawMessage, error) {
 	return out, rows.Err()
 }
 
-const revisionJSON = `(to_jsonb(r)-'created_tx'-'knowledge_id')||jsonb_build_object('id',r.knowledge_id,'type','knowledge','sources',(SELECT coalesce(jsonb_agg(source_id ORDER BY source_id),'[]'::jsonb) FROM knowledge_sources ks WHERE (ks.workspace_id,ks.knowledge_id,ks.revision)=(r.workspace_id,r.knowledge_id,r.revision)))`
+const revisionJSON = `(to_jsonb(r)-'created_tx'-'knowledge_id'-'workspace_id')||jsonb_build_object('id',r.knowledge_id,'type','knowledge','sources',(SELECT coalesce(jsonb_agg(source_id ORDER BY source_id),'[]'::jsonb) FROM knowledge_sources ks WHERE (ks.workspace_id,ks.knowledge_id,ks.revision)=(r.workspace_id,r.knowledge_id,r.revision)))`
 
 func (s *Service) read(ctx context.Context, tx *sql.Tx, op string, p Params) (Result, error) {
 	if op == "search" {
@@ -55,7 +55,7 @@ func (s *Service) read(ctx context.Context, tx *sql.Tx, op string, p Params) (Re
 		}
 		var a Attachment
 		var b []byte
-		err := tx.QueryRowContext(ctx, `SELECT id,source_id,name,mime,size,sha256,content FROM attachments WHERE workspace_id=$1 AND source_id=$2 AND id=$3`, p.WorkspaceID, p.ID, p.AttachmentID).Scan(&a.ID, &a.SourceID, &a.Name, &a.MIME, &a.Size, &a.SHA256, &b)
+		err := tx.QueryRowContext(ctx, `SELECT id,source_id,name,mime,size,sha256,content FROM attachments WHERE workspace_id=$1 AND source_id=$2 AND id=$3`, p.workspaceID, p.ID, p.AttachmentID).Scan(&a.ID, &a.SourceID, &a.Name, &a.MIME, &a.Size, &a.SHA256, &b)
 		a.Data = base64.StdEncoding.EncodeToString(b)
 		return result(a), err
 	}
@@ -63,19 +63,19 @@ func (s *Service) read(ctx context.Context, tx *sql.Tx, op string, p Params) (Re
 	var raw []byte
 	revision := p.Revision
 	if p.Type == "source" {
-		if err := tx.QueryRowContext(ctx, `SELECT (to_jsonb(s)-'created_tx')||jsonb_build_object('type','source') FROM sources s WHERE workspace_id=$1 AND id=$2`, p.WorkspaceID, p.ID).Scan(&raw); err != nil {
+		if err := tx.QueryRowContext(ctx, `SELECT (to_jsonb(s)-'created_tx'-'workspace_id')||jsonb_build_object('type','source') FROM sources s WHERE workspace_id=$1 AND id=$2`, p.workspaceID, p.ID).Scan(&raw); err != nil {
 			return Result{}, err
 		}
 	} else {
 		if revision == 0 {
-			if err := tx.QueryRowContext(ctx, `SELECT current_revision FROM knowledge WHERE workspace_id=$1 AND id=$2`, p.WorkspaceID, p.ID).Scan(&revision); err != nil {
+			if err := tx.QueryRowContext(ctx, `SELECT current_revision FROM knowledge WHERE workspace_id=$1 AND id=$2`, p.workspaceID, p.ID).Scan(&revision); err != nil {
 				return Result{}, err
 			}
 		}
-		if err := tx.QueryRowContext(ctx, `SELECT `+revisionJSON+` FROM knowledge_revisions r WHERE workspace_id=$1 AND knowledge_id=$2 AND revision=$3`, p.WorkspaceID, p.ID, revision).Scan(&raw); err != nil {
+		if err := tx.QueryRowContext(ctx, `SELECT `+revisionJSON+` FROM knowledge_revisions r WHERE workspace_id=$1 AND knowledge_id=$2 AND revision=$3`, p.workspaceID, p.ID, revision).Scan(&raw); err != nil {
 			return Result{}, err
 		}
-		rows, err := tx.QueryContext(ctx, `SELECT jsonb_build_object('id',s.id,'type','source','provenance',s.provenance,'created_at',s.created_at) FROM knowledge_sources ks JOIN sources s ON (s.workspace_id,s.id)=(ks.workspace_id,ks.source_id) WHERE ks.workspace_id=$1 AND ks.knowledge_id=$2 AND ks.revision=$3 ORDER BY s.id LIMIT $4 OFFSET $5`, p.WorkspaceID, p.ID, revision, p.Limit+1, p.Offset)
+		rows, err := tx.QueryContext(ctx, `SELECT jsonb_build_object('id',s.id,'type','source','provenance',s.provenance,'created_at',s.created_at) FROM knowledge_sources ks JOIN sources s ON (s.workspace_id,s.id)=(ks.workspace_id,ks.source_id) WHERE ks.workspace_id=$1 AND ks.knowledge_id=$2 AND ks.revision=$3 ORDER BY s.id LIMIT $4 OFFSET $5`, p.workspaceID, p.ID, revision, p.Limit+1, p.Offset)
 		if err != nil {
 			return Result{}, err
 		}
@@ -84,7 +84,7 @@ func (s *Service) read(ctx context.Context, tx *sql.Tx, op string, p Params) (Re
 			return Result{}, err
 		}
 		if p.History {
-			rows, err = tx.QueryContext(ctx, `SELECT `+revisionJSON+` FROM knowledge_revisions r WHERE workspace_id=$1 AND knowledge_id=$2 AND revision<=$3 ORDER BY revision DESC LIMIT $4 OFFSET $5`, p.WorkspaceID, p.ID, revision, p.Limit+1, p.Offset)
+			rows, err = tx.QueryContext(ctx, `SELECT `+revisionJSON+` FROM knowledge_revisions r WHERE workspace_id=$1 AND knowledge_id=$2 AND revision<=$3 ORDER BY revision DESC LIMIT $4 OFFSET $5`, p.workspaceID, p.ID, revision, p.Limit+1, p.Offset)
 			if err != nil {
 				return Result{}, err
 			}
@@ -95,7 +95,7 @@ func (s *Service) read(ctx context.Context, tx *sql.Tx, op string, p Params) (Re
 		}
 	}
 	d.Object = json.RawMessage(raw)
-	rows, err := tx.QueryContext(ctx, `SELECT a.id,a.source_id,a.name,a.mime,a.size,a.sha256 FROM attachments a WHERE a.workspace_id=$1 AND (($4='source' AND a.source_id=$2) OR ($4='knowledge' AND EXISTS(SELECT 1 FROM knowledge_sources ks WHERE ks.workspace_id=$1 AND ks.knowledge_id=$2 AND ks.revision=$3 AND ks.source_id=a.source_id))) ORDER BY a.id LIMIT $5 OFFSET $6`, p.WorkspaceID, p.ID, revision, p.Type, p.Limit+1, p.Offset)
+	rows, err := tx.QueryContext(ctx, `SELECT a.id,a.source_id,a.name,a.mime,a.size,a.sha256 FROM attachments a WHERE a.workspace_id=$1 AND (($4='source' AND a.source_id=$2) OR ($4='knowledge' AND EXISTS(SELECT 1 FROM knowledge_sources ks WHERE ks.workspace_id=$1 AND ks.knowledge_id=$2 AND ks.revision=$3 AND ks.source_id=a.source_id))) ORDER BY a.id LIMIT $5 OFFSET $6`, p.workspaceID, p.ID, revision, p.Type, p.Limit+1, p.Offset)
 	if err != nil {
 		return Result{}, err
 	}
